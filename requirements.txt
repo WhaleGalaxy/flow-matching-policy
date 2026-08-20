@@ -1,0 +1,24 @@
+# --- core ---
+torch
+torchvision
+# --- vision / language backbones ---
+timm
+transformers
+# --- robotics env ---
+mani-skill
+gymnasium
+h5py
+# --- config / experiment tracking ---
+hydra-core
+omegaconf
+wandb
+# --- data / eval / utils ---
+numpy
+pandas
+scipy
+imageio
+imageio-ffmpeg
+matplotlib
+tqdm
+# --- testing ---
+pytest

@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# data / checkpoints / logs
+data/
+demos/
+*.h5
+*.ckpt
+*.pt
+*.npy
+wandb/
+outputs/
+multirun/
+
+# media
+*.gif
+*.mp4
+
+# env
+.venv/
+.env

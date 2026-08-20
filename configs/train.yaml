@@ -1,0 +1,22 @@
+defaults:
+  - model: fm
+  - task: pick
+  - _self_
+
+lr: 1.0e-4
+batch_size: 128
+epochs: 200
+seed: 42
+use_proprio: true
+cfg_dropout: 0.2   # classifier-free guidance null-condition dropout, week1 day5
+
+obs_horizon: 2
+act_horizon: 16
+
+eval:
+  every_n_epochs: 20
+  n_episodes: 100
+
+wandb:
+  project: fm-policy
+  mode: online

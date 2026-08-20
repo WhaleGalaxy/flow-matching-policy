@@ -1,0 +1,5 @@
+name: PegInsertionSide-v1
+instruction: "Insert the peg into the hole"
+act_dim: 7
+proprio_dim: 9
+demo_path: ~/.maniskill/demos/PegInsertionSide-v1/trajectory.h5

@@ -1,0 +1,5 @@
+name: PickCube-v1
+instruction: "Pick up the red cube"
+act_dim: 7
+proprio_dim: 9
+demo_path: ~/.maniskill/demos/PickCube-v1/trajectory.h5
