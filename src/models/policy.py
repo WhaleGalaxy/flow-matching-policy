@@ -185,3 +185,90 @@ def fm_loss(denoiser: nn.Module, action: torch.Tensor, context: torch.Tensor) ->
     t = torch.rand(action.shape[0], device=action.device)
     xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * action
     return F.mse_loss(denoiser(xt, t, context), action - x0)
+
+
+class DDPMPolicy(nn.Module):
+    """Diffusion Policy 风格的基线：与 FMPolicy **完全相同的骨干**，
+    只把训练目标换成 DDPM 的 ε-prediction。
+
+    这样对比才干净：两者的编码器、denoiser 结构、参数量、训练预算全部一致，
+    唯一的差别是"预测速度场 + Euler 积分" vs "预测噪声 + 逐步去噪"。
+    任何性能/延迟差异都只能归因于这个建模选择本身。
+
+    噪声调度用 cosine（Nichol & Dhariwal），比 linear 在少步采样时更稳。
+    """
+
+    def __init__(self, d_model=256, act_dim=7, act_horizon=16, n_layers=4, n_heads=8,
+                 img_size=126, proprio_dim=9, use_proprio=True, cfg_dropout=0.2,
+                 n_train_steps: int = 100):
+        super().__init__()
+        self.act_dim, self.act_horizon = act_dim, act_horizon
+        self.cfg_dropout = cfg_dropout
+        self.n_train_steps = n_train_steps
+        self.encoder = ObsEncoder(d_model, img_size, proprio_dim, use_proprio)
+        self.normalizer = ActionNormalizer(act_dim)
+        self.denoiser = FMDenoiser(
+            d_model=d_model, d_context=d_model, n_layers=n_layers,
+            n_heads=n_heads, act_dim=act_dim, act_horizon=act_horizon,
+        )
+        self.register_buffer("alphas_cumprod", self._cosine_schedule(n_train_steps))
+
+    @staticmethod
+    def _cosine_schedule(T: int, s: float = 0.008) -> torch.Tensor:
+        t = torch.linspace(0, T, T + 1) / T
+        f = torch.cos((t + s) / (1 + s) * torch.pi / 2) ** 2
+        alphas_cumprod = f / f[0]
+        betas = (1 - alphas_cumprod[1:] / alphas_cumprod[:-1]).clamp(max=0.999)
+        return torch.cumprod(1 - betas, dim=0)
+
+    def encode_obs(self, rgb, proprio, instructions):
+        return self.encoder(rgb, proprio, instructions)
+
+    def compute_loss(self, batch):
+        instructions = list(batch["instruction"])
+        if self.training and self.cfg_dropout > 0:
+            mask = torch.rand(len(instructions)) < self.cfg_dropout
+            instructions = [NULL_INSTRUCTION if m else s
+                            for s, m in zip(instructions, mask.tolist())]
+
+        context = self.encode_obs(batch["rgb"], batch["proprio"], instructions)
+        x0 = self.normalizer.normalize(batch["action"])           # 干净动作
+        B = x0.shape[0]
+        i = torch.randint(0, self.n_train_steps, (B,), device=x0.device)
+        a = self.alphas_cumprod[i][:, None, None]
+        noise = torch.randn_like(x0)
+        xt = a.sqrt() * x0 + (1 - a).sqrt() * noise                # 前向加噪
+
+        # denoiser 复用同一个网络，t 归一化到 [0,1] 喂给它的时间嵌入
+        eps_pred = self.denoiser(xt, i.float() / self.n_train_steps, context)
+        return F.mse_loss(eps_pred, noise)                        # ε-prediction
+
+    @torch.no_grad()
+    def predict_action(self, rgb, proprio, instructions, n_steps=100, guidance=1.0):
+        """DDIM 采样（确定性，η=0），n_steps 可小于训练步数。"""
+        B, device = rgb.shape[0], rgb.device
+        use_cfg = guidance != 1.0
+
+        ctx = self.encode_obs(rgb, proprio, list(instructions))
+        if use_cfg:
+            ctx = torch.cat([ctx, self.encode_obs(rgb, proprio, [NULL_INSTRUCTION] * B)], 0)
+
+        # 从训练用的 T 步里等距抽 n_steps 个时间点
+        times = torch.linspace(self.n_train_steps - 1, 0, n_steps).long().to(device)
+        x = torch.randn(B, self.act_horizon, self.act_dim, device=device)
+
+        for k, i in enumerate(times):
+            t_in = torch.full((B,), i.item() / self.n_train_steps, device=device)
+            if use_cfg:
+                e = self.denoiser(x.repeat(2, 1, 1), t_in.repeat(2), ctx)
+                e_cond, e_null = e.chunk(2, 0)
+                eps = e_null + guidance * (e_cond - e_null)
+            else:
+                eps = self.denoiser(x, t_in, ctx)
+
+            a_t = self.alphas_cumprod[i]
+            a_prev = self.alphas_cumprod[times[k + 1]] if k + 1 < len(times) else torch.tensor(1.0, device=device)
+            x0_pred = (x - (1 - a_t).sqrt() * eps) / a_t.sqrt()
+            x = a_prev.sqrt() * x0_pred + (1 - a_prev).sqrt() * eps   # DDIM 更新
+
+        return self.normalizer.denormalize(x)

@@ -1,0 +1,9 @@
+name: ddpm
+d_model: 256
+n_layers: 4
+n_heads: 8
+n_train_steps: 100   # 训练用的扩散步数
+n_sample_steps: 100  # DDIM 采样步数；与 FM 的 10 步对比即延迟差距的来源
+guidance_weight: 1.5
+cfg_dropout: 0.2
+ema_decay: 0.9999

@@ -20,7 +20,8 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.data.dataset import (ManiskillDataset, build_multitask_dataset,  # noqa: E402
                               collate, default_h5_path)
-from src.models.policy import BCPolicy, EMA, FMPolicy  # noqa: E402
+from src.evaluate import make_env, rollout  # noqa: E402
+from src.models.policy import BCPolicy, DDPMPolicy, EMA, FMPolicy  # noqa: E402
 
 
 def build_dataset(cfg):
@@ -39,8 +40,11 @@ def build_policy(cfg, act_dim, proprio_dim):
                   d_model=cfg.model.d_model)
     if cfg.model.name == "bc":
         return BCPolicy(**common)
-    return FMPolicy(n_layers=cfg.model.n_layers, n_heads=cfg.model.n_heads,
-                    cfg_dropout=cfg.model.get("cfg_dropout", 0.2), **common)
+    gen = dict(n_layers=cfg.model.n_layers, n_heads=cfg.model.n_heads,
+               cfg_dropout=cfg.model.get("cfg_dropout", 0.2), **common)
+    if cfg.model.name == "ddpm":
+        return DDPMPolicy(n_train_steps=cfg.model.n_train_steps, **gen)
+    return FMPolicy(**gen)
 
 
 def lr_at(step, cfg):
@@ -133,6 +137,28 @@ def main(cfg: DictConfig) -> None:
                             "model": policy.state_dict(),
                             "ema": ema.ema_model.state_dict()}, ckpt)
                 print(f"  已保存 {ckpt.name}")
+
+                if cfg.eval.n_episodes > 0:
+                    # 评测一律用 EMA 权重
+                    scores = {}
+                    for task in cfg.tasks:
+                        env = make_env(task)
+                        try:
+                            r = rollout(ema.ema_model, env, task,
+                                        n_episodes=cfg.eval.n_episodes,
+                                        obs_horizon=cfg.obs_horizon,
+                                        execute_horizon=cfg.eval.execute_horizon,
+                                        img_size=cfg.img_size,
+                                        n_steps=cfg.model.get("n_sample_steps", 10),
+                                        guidance=cfg.eval.get("guidance", 1.0))
+                        finally:
+                            env.close()
+                        scores[task] = r["success_rate"]
+                        print(f"  [eval] {task:22s} SR {100*r['success_rate']:5.1f}%  "
+                              f"平均步长 {r['mean_length']:.0f}")
+                    if use_wandb:
+                        wandb.log({f"eval/{t}_sr": v for t, v in scores.items()} | {"step": step})
+                    policy.train()
 
     print(f"\n训练完成，用时 {(time.perf_counter()-t0)/60:.1f} 分钟")
     if use_wandb:

@@ -32,6 +32,7 @@ eval:
   every: 5000
   n_episodes: 25         # 训练中途用少量 episode 看趋势，最终评测用 100
   execute_horizon: 8
+  guidance: 1.0
 
 # ---- 日志 / 产物 ----
 wandb:
