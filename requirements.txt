@@ -16,6 +16,7 @@ wandb
 numpy
 pandas
 scipy
+scikit-learn
 imageio
 imageio-ffmpeg
 matplotlib
