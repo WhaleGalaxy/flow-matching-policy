@@ -4,6 +4,8 @@ torchvision
 # --- vision / language backbones ---
 timm
 transformers
+sentencepiece
+protobuf
 # --- robotics env ---
 mani-skill
 gymnasium
