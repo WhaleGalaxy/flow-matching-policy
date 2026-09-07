@@ -44,7 +44,7 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     print(f"GPU: {torch.cuda.get_device_name(0)}   batch={BATCH}\n")
 
-    common = dict(act_dim=8, act_horizon=16, img_size=126, proprio_dim=9)
+    common = dict(act_dim=7, act_horizon=16, img_size=126, proprio_dim=9)
     fm = FMPolicy(**common).to(DEV).eval()
     ddpm = DDPMPolicy(**common).to(DEV).eval()
 

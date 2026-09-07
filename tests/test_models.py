@@ -85,3 +85,32 @@ def test_normalizer_roundtrip_and_persists_in_state_dict():
     restored = ActionNormalizer(A)
     restored.load_state_dict(n.state_dict())
     assert torch.allclose(restored.mean, n.mean) and bool(restored.fitted)
+
+
+def test_action_representation_snr_detects_absolute_encoding():
+    """信噪比检查必须能区分'绝对位置'和'增量'两种动作表示。
+
+    这是 docs/debugging.md 里那个坑的回归测试：绝对表示下动作几乎完全由
+    当前状态决定，任务信号趋近 0；增量表示下任务信号占主导。
+    """
+    import numpy as np
+    from torch.utils.data import Dataset
+
+    from src.diagnostics import action_representation_snr
+
+    class Fake(Dataset):
+        def __init__(self, absolute: bool, n=2048, H=16, A=7, P=9):
+            g = torch.Generator().manual_seed(0)
+            self.state = torch.randn(n, P, generator=g)
+            delta = 0.1 * torch.randn(n, H, A, generator=g)   # 任务相关的动作
+            base = self.state[:, :A].unsqueeze(1)              # 当前构型
+            self.action = base + delta if absolute else delta
+        def __len__(self): return len(self.action)
+        def __getitem__(self, i):
+            return {"rgb": torch.zeros(2, 3, 8, 8), "proprio": self.state[i].repeat(2, 1),
+                    "action": self.action[i], "instruction": "x"}
+
+    abs_snr = action_representation_snr(Fake(absolute=True), n_batches=4, num_workers=0)
+    del_snr = action_representation_snr(Fake(absolute=False), n_batches=4, num_workers=0)
+    assert abs_snr["signal"] < 0.15, f"绝对表示的任务信号应很低，得到 {abs_snr['signal']:.3f}"
+    assert del_snr["signal"] > 0.80, f"增量表示的任务信号应很高，得到 {del_snr['signal']:.3f}"

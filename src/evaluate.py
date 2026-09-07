@@ -19,17 +19,14 @@ def _np(x):
     return x.cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.data.dataset import TASK_INSTRUCTIONS, preprocess_obs_rgb  # noqa: E402
+from src.data.dataset import (CONTROL_MODE, TASK_INSTRUCTIONS,  # noqa: E402
+                              preprocess_obs_rgb)
 
 
-# 演示数据采集时用的控制模式。**必须**与评测环境一致 ——
-# ManiSkill3 的默认是 pd_joint_delta_pos（增量），而 motionplanning 演示是
-# pd_joint_pos（绝对关节角）。不显式指定的话，策略输出的绝对角度会被当成增量
-# 并裁剪到 [-1,1]，成功率会锁死在一个与训练进度无关的低值上。
-DEMO_CONTROL_MODE = "pd_joint_pos"
-
-
-def make_env(task: str, num_envs: int = 1, control_mode: str = DEMO_CONTROL_MODE):
+# 评测环境的控制模式**必须**与训练数据一致，且必须显式指定 ——
+# gym.make 的默认是 pd_joint_delta_pos，与我们的数据不符时，策略输出会被
+# 错误解释并裁剪，成功率会锁死在一个与训练进度无关的低值上（见 docs/debugging.md）。
+def make_env(task: str, num_envs: int = 1, control_mode: str = CONTROL_MODE):
     import gymnasium as gym
     import mani_skill.envs  # noqa: F401
 

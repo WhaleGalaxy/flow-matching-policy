@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.data.dataset import (ManiskillDataset, build_multitask_dataset,  # noqa: E402
                               collate, default_h5_path)
+from src.diagnostics import check_dataset  # noqa: E402
 from src.evaluate import make_env, rollout  # noqa: E402
 from src.models.policy import (BCPolicy, DDPMPolicy, EMA, FMPolicy,  # noqa: E402
                                trainable_state_dict)
@@ -77,6 +78,11 @@ def main(cfg: DictConfig) -> None:
     for d in subsets:
         print(f"  {d.task:22s} {len(d):>8,} 样本  act_dim={d.act_dim} proprio_dim={d.proprio_dim}", flush=True)
 
+    # 训练前健全性检查 —— 几秒钟，但能拦住整类"loss 很低却完全不工作"的问题
+    print("\n训练前检查：", flush=True)
+    check_dataset(subsets[0])
+    print("", flush=True)
+
     loader = DataLoader(
         dataset, batch_size=cfg.batch_size, sampler=sampler, shuffle=(sampler is None),
         num_workers=cfg.num_workers, collate_fn=collate, drop_last=True,
@@ -84,7 +90,14 @@ def main(cfg: DictConfig) -> None:
     )
 
     # ---- 模型 ----
-    policy = build_policy(cfg, subsets[0].act_dim, subsets[0].proprio_dim).to(cfg.device)
+    act_dim, proprio_dim = subsets[0].act_dim, subsets[0].proprio_dim
+    for d in subsets[1:]:
+        assert (d.act_dim, d.proprio_dim) == (act_dim, proprio_dim), \
+            f"任务间的动作/本体维度不一致：{d.task}"
+    OmegaConf.set_struct(cfg, False)
+    cfg.act_dim, cfg.proprio_dim = act_dim, proprio_dim   # 存进 ckpt，评测时直接读
+    OmegaConf.set_struct(cfg, True)
+    policy = build_policy(cfg, act_dim, proprio_dim).to(cfg.device)
     # 归一化统计量从训练集拟合，存进 buffer 随 checkpoint 一起走
     all_actions = torch.cat([d.sample_actions() for d in subsets])
     policy.normalizer.fit(all_actions.to(cfg.device))

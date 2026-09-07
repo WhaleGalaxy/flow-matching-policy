@@ -31,8 +31,9 @@ def load_policy(ckpt_path: Path, use_ema: bool = True, device: str = "cuda"):
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ck["cfg"]
     name = cfg["model"]["name"]
-    common = dict(act_dim=8, act_horizon=cfg["act_horizon"], img_size=cfg["img_size"],
-                  proprio_dim=9, use_proprio=cfg["use_proprio"],
+    common = dict(act_dim=cfg.get("act_dim", 8), act_horizon=cfg["act_horizon"],
+                  img_size=cfg["img_size"],
+                  proprio_dim=cfg.get("proprio_dim", 9), use_proprio=cfg["use_proprio"],
                   d_model=cfg["model"]["d_model"])
     if name == "bc":
         policy = BCPolicy(**common)
