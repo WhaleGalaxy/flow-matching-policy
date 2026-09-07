@@ -21,3 +21,5 @@ multirun/
 # env
 .venv/
 .env
+.hydra/
+*.log

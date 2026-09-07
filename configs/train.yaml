@@ -1,22 +1,41 @@
 defaults:
   - model: fm
-  - task: pick
   - _self_
 
-lr: 1.0e-4
-batch_size: 128
-epochs: 200
-seed: 42
-use_proprio: true
-cfg_dropout: 0.2   # classifier-free guidance null-condition dropout, week1 day5
+# 任务：单任务给一个，多任务给多个（自动启用等比例采样）
+tasks: [PickCube-v1]
 
+seed: 42
+device: cuda
+
+# ---- 数据 ----
 obs_horizon: 2
 act_horizon: 16
+img_size: 126
+max_episodes: null       # null = 用全部演示
+num_workers: 6
+batch_size: 128
 
+# ---- 优化 ----
+lr: 1.0e-4
+weight_decay: 1.0e-4
+steps: 30000             # 按步数而非 epoch 计，多任务下更好比较
+warmup_steps: 500
+grad_clip: 1.0
+bf16: true
+
+# ---- 模型共享超参 ----
+use_proprio: true
+
+# ---- 评测 ----
 eval:
-  every_n_epochs: 20
-  n_episodes: 100
+  every: 5000
+  n_episodes: 25         # 训练中途用少量 episode 看趋势，最终评测用 100
+  execute_horizon: 8
 
+# ---- 日志 / 产物 ----
 wandb:
+  enabled: false
   project: fm-policy
-  mode: online
+out_dir: outputs
+run_name: null           # null = 自动根据 model/tasks/seed 生成
