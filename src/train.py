@@ -1,5 +1,8 @@
 """训练入口（Hydra 驱动）。
 
+注意：日志重定向到文件时 stdout 是块缓冲的，所有 print 都带 flush=True，
+否则后台训练看不到实时进度。
+
     python -m src.train                                   # 默认 FM + PickCube
     python -m src.train model=bc                          # BC 基线
     python -m src.train tasks="[PickCube-v1,StackCube-v1,PegInsertionSide-v1]"
@@ -21,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.data.dataset import (ManiskillDataset, build_multitask_dataset,  # noqa: E402
                               collate, default_h5_path)
 from src.evaluate import make_env, rollout  # noqa: E402
-from src.models.policy import BCPolicy, DDPMPolicy, EMA, FMPolicy  # noqa: E402
+from src.models.policy import (BCPolicy, DDPMPolicy, EMA, FMPolicy,  # noqa: E402
+                               trainable_state_dict)
 
 
 def build_dataset(cfg):
@@ -64,14 +68,14 @@ def main(cfg: DictConfig) -> None:
     run_name = cfg.run_name or f"{cfg.model.name}_{'+'.join(t.split('-')[0] for t in cfg.tasks)}_s{cfg.seed}"
     out_dir = Path(hydra.utils.get_original_cwd()) / cfg.out_dir / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(OmegaConf.to_yaml(cfg))
-    print(f"输出目录: {out_dir}\n")
+    print(OmegaConf.to_yaml(cfg), flush=True)
+    print(f"输出目录: {out_dir}\n", flush=True)
 
     # ---- 数据 ----
     dataset, sampler, subsets = build_dataset(cfg)
-    print(f"数据集: {len(dataset):,} 个样本 / {len(cfg.tasks)} 个任务")
+    print(f"数据集: {len(dataset):,} 个样本 / {len(cfg.tasks)} 个任务", flush=True)
     for d in subsets:
-        print(f"  {d.task:22s} {len(d):>8,} 样本  act_dim={d.act_dim} proprio_dim={d.proprio_dim}")
+        print(f"  {d.task:22s} {len(d):>8,} 样本  act_dim={d.act_dim} proprio_dim={d.proprio_dim}", flush=True)
 
     loader = DataLoader(
         dataset, batch_size=cfg.batch_size, sampler=sampler, shuffle=(sampler is None),
@@ -85,7 +89,7 @@ def main(cfg: DictConfig) -> None:
     all_actions = torch.cat([d.sample_actions() for d in subsets])
     policy.normalizer.fit(all_actions.to(cfg.device))
     n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    print(f"\n模型 {cfg.model.name}: {n_train/1e6:.2f}M 可训练参数")
+    print(f"\n模型 {cfg.model.name}: {n_train/1e6:.2f}M 可训练参数", flush=True)
 
     params = [p for p in policy.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -126,7 +130,7 @@ def main(cfg: DictConfig) -> None:
                 avg = sum(running) / len(running); running = []
                 ips = step / (time.perf_counter() - t0)
                 print(f"step {step:6d}/{cfg.steps}  loss {avg:.4f}  "
-                      f"lr {opt.param_groups[0]['lr']:.2e}  |g| {gn:.2f}  {ips:.1f} it/s")
+                      f"lr {opt.param_groups[0]['lr']:.2e}  |g| {gn:.2f}  {ips:.1f} it/s", flush=True)
                 if use_wandb:
                     wandb.log({"train/loss": avg, "train/lr": opt.param_groups[0]["lr"],
                                "train/grad_norm": float(gn), "step": step})
@@ -134,9 +138,9 @@ def main(cfg: DictConfig) -> None:
             if step % cfg.eval.every == 0 or step == cfg.steps:
                 ckpt = out_dir / f"ckpt_{step}.pt"
                 torch.save({"step": step, "cfg": OmegaConf.to_container(cfg, resolve=True),
-                            "model": policy.state_dict(),
-                            "ema": ema.ema_model.state_dict()}, ckpt)
-                print(f"  已保存 {ckpt.name}")
+                            "model": trainable_state_dict(policy),
+                            "ema": trainable_state_dict(ema.ema_model)}, ckpt)
+                print(f"  已保存 {ckpt.name}", flush=True)
 
                 if cfg.eval.n_episodes > 0:
                     # 评测一律用 EMA 权重
@@ -155,7 +159,7 @@ def main(cfg: DictConfig) -> None:
                             env.close()
                         scores[task] = r["success_rate"]
                         print(f"  [eval] {task:22s} SR {100*r['success_rate']:5.1f}%  "
-                              f"平均步长 {r['mean_length']:.0f}")
+                              f"平均步长 {r['mean_length']:.0f}", flush=True)
                     if use_wandb:
                         wandb.log({f"eval/{t}_sr": v for t, v in scores.items()} | {"step": step})
                     policy.train()

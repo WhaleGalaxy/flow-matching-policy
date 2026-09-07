@@ -272,3 +272,25 @@ class DDPMPolicy(nn.Module):
             x = a_prev.sqrt() * x0_pred + (1 - a_prev).sqrt() * eps   # DDIM 更新
 
         return self.normalizer.denormalize(x)
+
+
+def trainable_state_dict(model: nn.Module) -> dict:
+    """只保留可训练参数和全部 buffer，丢掉冻结的骨干权重。
+
+    完整 state_dict 里 99% 是冻结的 DINOv2 + SigLIP 权重（单个 checkpoint 1.1GB），
+    它们完全由 timm/HF 的预训练标识决定，重新加载即可，没必要随每个 checkpoint 存一份。
+    buffer 必须保留 —— 归一化统计量和噪声调度都在里面。
+    """
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    buffers = {n for n, _ in model.named_buffers()}
+    return {k: v.detach().cpu() for k, v in model.state_dict().items()
+            if k in trainable or k in buffers}
+
+
+def load_trainable_state_dict(model: nn.Module, state: dict) -> None:
+    """载入 trainable_state_dict 保存的权重；冻结骨干保持预训练初始化。"""
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    assert not unexpected, f"checkpoint 里有模型不认识的键: {unexpected[:5]}"
+    frozen = {n for n, p in model.named_parameters() if not p.requires_grad}
+    unexplained = [k for k in missing if k not in frozen]
+    assert not unexplained, f"缺失的键不属于冻结骨干: {unexplained[:5]}"
