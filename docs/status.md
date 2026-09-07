@@ -18,7 +18,7 @@
 | 训练脚本 | ✅ | Hydra + BF16 + 训练前检查 + 周期评测 |
 | 评测 / 消融 / 报告脚本 | ✅ | 消融复用 checkpoint，无需重训 |
 | 单元测试 | ✅ | 9 个全通过 |
-| **数据（pd_ee_delta_pose）** | 🔄 | PickCube 完成；StackCube / PegInsertion 转换中 |
+| **数据（pd_ee_delta_pose）** | ✅ | 三任务共 331,283 样本，维度一致 (act=7, proprio=9) |
 | 正式训练结果 | ⬜ | **下一步** |
 
 ### 第一轮训练的结论
@@ -27,7 +27,16 @@
 该表示下 98.4% 的动作方差仅由"手臂当前在哪"决定，任务信号只有 1.6%。
 完整排查过程见 `docs/debugging.md`。
 
-改用 `pd_ee_delta_pose` 后，实测任务信号 **69.5%**（提升 43 倍）。
+改用 `pd_ee_delta_pose` 后，三个任务的任务信号分别为：
+
+| 任务 | 样本数 | 任务信号 |
+|---|---|---|
+| PickCube-v1 | 78,465 | 69.1% |
+| StackCube-v1 | 108,260 | 74.2% |
+| PegInsertionSide-v1 | 144,558 | 57.8% |
+
+相比原来的 1.6% 提升了约 40 倍。三任务的 `act_dim=7` / `proprio_dim=9` 一致，
+多任务训练可直接用。
 
 ## 明天怎么开始
 
@@ -38,8 +47,7 @@ cd ~/flow_matching/fm_policy
 # 0) GPU 模块每次重启后需重新加载
 sudo modprobe nvidia nvidia_uvm && nvidia-smi
 
-# 1) 确认三个任务的数据都转换完了
-ls -lh ~/.maniskill/demos/*/motionplanning/trajectory.rgb.pd_ee_delta_pose.physx_cpu.h5
+# 1) 数据已就绪（三任务已转换并校验，无需重跑）
 
 # 2) 先跑单任务 FM 验证修复（约 45 分钟，20000 步）
 #    关键看训练开始时打印的"任务信号"应 ≈70%，以及 SR 是否随训练上升
@@ -83,5 +91,7 @@ python scripts/make_report.py                                            # 汇�
 
 - `outputs/fm_PickCube_s42/` 下是第一轮（pd_joint_pos）的 checkpoint，
   每个 1.1GB 且已无用，可以删掉；后续 checkpoint 已降到 27MB。
-- 旧的 `trajectory.rgb.pd_joint_pos.physx_cpu.h5`（合计约 7.7GB）也可以删。
+- 旧的 `pd_joint_pos` 数据（约 7.7GB）已无用，可删：
+  `rm ~/.maniskill/demos/*/motionplanning/trajectory.rgb.pd_joint_pos.physx_cpu.h5`
+  （demo 目录当前占 16GB，磁盘剩余 115GB，不删也不影响）
 - WandB 尚未接入（`++wandb.enabled=true` 需先 `wandb login`）。
