@@ -13,18 +13,33 @@ from pathlib import Path
 import numpy as np
 import torch
 
+
+def _np(x):
+    """ManiSkill3 返回的观测/渲染结果是 CUDA tensor，转 numpy 前需先回 CPU。"""
+    return x.cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.data.dataset import TASK_INSTRUCTIONS, preprocess_obs_rgb  # noqa: E402
 
 
-def make_env(task: str, num_envs: int = 1, render: bool = False):
+# 演示数据采集时用的控制模式。**必须**与评测环境一致 ——
+# ManiSkill3 的默认是 pd_joint_delta_pos（增量），而 motionplanning 演示是
+# pd_joint_pos（绝对关节角）。不显式指定的话，策略输出的绝对角度会被当成增量
+# 并裁剪到 [-1,1]，成功率会锁死在一个与训练进度无关的低值上。
+DEMO_CONTROL_MODE = "pd_joint_pos"
+
+
+def make_env(task: str, num_envs: int = 1, control_mode: str = DEMO_CONTROL_MODE):
     import gymnasium as gym
     import mani_skill.envs  # noqa: F401
 
-    return gym.make(
-        task, obs_mode="rgb", render_mode="rgb_array",
+    env = gym.make(
+        task, obs_mode="rgb", render_mode="rgb_array", control_mode=control_mode,
         num_envs=num_envs, sim_backend="physx_cpu" if num_envs == 1 else "physx_cuda",
     )
+    assert env.unwrapped.control_mode == control_mode, (
+        f"控制模式不符：环境用 {env.unwrapped.control_mode}，演示数据是 {control_mode}")
+    return env
 
 
 @torch.no_grad()
@@ -76,11 +91,11 @@ def rollout(
             for k in range(min(execute_horizon, chunk.shape[0])):
                 obs, _, terminated, truncated, info = env.step(chunk[k].cpu().numpy())
                 if record_frames and ep == 0:
-                    frames.append(np.asarray(env.render()[0]))
+                    frames.append(_np(env.render()[0]))
                 push(obs)
                 t += 1
-                success = bool(np.asarray(info["success"]).reshape(-1)[0])
-                if success or bool(np.asarray(terminated).reshape(-1)[0]) or t >= max_steps:
+                success = bool(_np(info["success"]).reshape(-1)[0])
+                if success or bool(_np(terminated).reshape(-1)[0]) or t >= max_steps:
                     break
 
         successes.append(float(success))
