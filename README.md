@@ -36,3 +36,37 @@ fm_policy/
 
 See the execution checklist for the day-by-day plan. Progress log will be kept here
 once Week 1 (encoders + BC baseline) is done.
+
+## Environment setup
+
+```bash
+conda activate robot          # python 3.10, torch 2.5.1+cu121
+```
+
+### GPU (this machine)
+
+The full `nvidia-driver-570` metapackage breaks the GUI on this laptop
+(Intel iGPU + RTX 4060 hybrid, Ubuntu 20.04 + Xorg 1.20): it installs an Xorg
+display driver and replaces the system GL stack, and gdm then fails to start.
+
+Only the compute half is needed. `scripts/setup_gpu_headless.sh` installs
+`nvidia-headless-570` + `nvidia-utils-570` (kernel module + CUDA runtime, no
+Xorg driver, no GL libs) and configures the modules to *not* auto-load at boot,
+so the boot path is untouched:
+
+```bash
+sudo bash scripts/setup_gpu_headless.sh
+```
+
+Then, before any training run:
+
+```bash
+sudo modprobe nvidia nvidia_uvm    # load the module on demand
+nvidia-smi                          # verify
+```
+
+Recovery, if the display ever breaks again:
+
+```bash
+sudo apt purge '^nvidia-.*' && sudo apt autoremove
+```
