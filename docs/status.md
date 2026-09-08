@@ -132,3 +132,40 @@ python scripts/make_report.py                                            # 汇�
   `rm ~/.maniskill/demos/*/motionplanning/trajectory.rgb.pd_joint_pos.physx_cpu.h5`
   （demo 目录当前占 16GB，磁盘剩余 115GB，不删也不影响）
 - WandB 尚未接入（`++wandb.enabled=true` 需先 `wandb login`）。
+
+
+## 多任务结果与一个实验设计缺口（2026-09-09）
+
+多任务训练（20000 步，三任务等比例采样）的中途评测：PickCube 4–8%，
+**StackCube 与 PegInsertion 在全部五个评测点都是 0.0%，且平均步长精确等于 300**
+（每个 episode 都跑满超时）。
+
+"各评测点精确相等"正是第一轮失败的特征，所以先排除了测量问题。用记录的 seed
+复现初始状态、把演示动作原样回放进评测环境（`scripts/check_env_replay.py`）：
+
+| 任务 | 回放成功 | 演示平均长度 |
+|---|---|---|
+| PickCube-v1 | 10/10 | 73 步 |
+| StackCube-v1 | 10/10 | 108 步 |
+| PegInsertionSide-v1 | 10/10 | 158 步 |
+
+三个任务的评测环境都是对的，演示长度也都远在 300 步上限之内。**0% 是真实结果。**
+
+### 缺口：无法区分"任务难"和"多任务稀释了预算"
+
+队列里只有 PickCube 的单任务训练，StackCube 和 PegInsertion **只出现在多任务那一轮**。
+而多任务在同样的 20000 步下，每个任务分到的梯度更新只有单任务的三分之一。
+因此现在无法判断这两个任务的 0% 来自：
+
+- 任务本身更难（精密放置 / 插入，且只用了 `base_camera`，没接腕部相机），还是
+- 多任务把训练预算稀释了三倍
+
+**补齐的办法**：各跑一轮单任务（约 45 分钟/轮）
+
+```bash
+python -m src.train tasks=[StackCube-v1]
+python -m src.train tasks=[PegInsertionSide-v1]
+```
+
+在此之前，README 里不应把 StackCube/PegInsertion 的 0% 表述成"方法在这些任务上无效" ——
+现有证据只支持"在多任务、20000 步、单相机的条件下未能学会"。
