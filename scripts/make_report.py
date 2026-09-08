@@ -141,6 +141,34 @@ def plot_all(df: pd.DataFrame, out_dir: Path):
     return figs
 
 
+README_BEGIN = "<!-- RESULTS_TABLE -->"
+README_END = "<!-- /RESULTS_TABLE -->"
+
+
+def write_readme(table: str, figs: list, readme: Path, weights: str) -> None:
+    """把结果表写进 README 的标记区间，幂等：重复运行只替换区间内容。"""
+    text = readme.read_text()
+    assert README_BEGIN in text, f"README 里找不到 {README_BEGIN} 标记"
+
+    body = [table, ""]
+    for f in figs:
+        rel = f.as_posix()
+        body.append(f"![{f.stem}]({rel})")
+    body.append("")
+    body.append(f"*成功率为 100 episode 的评测结果，多 seed 取 mean±std；"
+                f"推理权重：{'EMA' if weights == 'ema' else '在线（非 EMA）'}。"
+                f"复现：`python scripts/make_report.py --weights {weights}`*")
+    block = f"{README_BEGIN}\n\n" + "\n".join(body) + f"\n\n{README_END}"
+
+    if README_END in text:
+        head, _, rest = text.partition(README_BEGIN)
+        _, _, tail = rest.partition(README_END)
+        text = head + block + tail
+    else:
+        text = text.replace(README_BEGIN, block)
+    readme.write_text(text)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", type=Path, default=Path("outputs/results.csv"))
@@ -149,6 +177,9 @@ def main():
     # 聚合——那等于把两个不同的推理配置平均掉。默认只报 EMA。
     ap.add_argument("--weights", choices=("ema", "online", "both"), default="ema",
                     help="用哪套权重的评测结果出表（默认 ema）")
+    ap.add_argument("--write-readme", action="store_true",
+                    help=f"把结果表和图写进 README 的 {README_BEGIN} 标记区间")
+    ap.add_argument("--readme", type=Path, default=Path("README.md"))
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv)
@@ -170,6 +201,9 @@ def main():
     print("\n生成的图：")
     for f in figs:
         print(f"  {f}")
+    if args.write_readme:
+        write_readme(main_table(df), figs, args.readme, args.weights)
+        print(f"\n已写入 {args.readme}")
 
 
 if __name__ == "__main__":
