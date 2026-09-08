@@ -7,7 +7,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.models.denoiser import AdaLN, CrossAttention, FMDenoiser, SinusoidalPosEmb
-from src.models.policy import ActionNormalizer, EMA, fm_loss
+from src.models.policy import (ActionNormalizer, EMA, fm_loss,
+                               load_trainable_state_dict, trainable_state_dict)
 
 D, H, A, L = 256, 16, 8, 83
 
@@ -114,3 +115,52 @@ def test_action_representation_snr_detects_absolute_encoding():
     del_snr = action_representation_snr(Fake(absolute=False), n_batches=4, num_workers=0)
     assert abs_snr["signal"] < 0.15, f"绝对表示的任务信号应很低，得到 {abs_snr['signal']:.3f}"
     assert del_snr["signal"] > 0.80, f"增量表示的任务信号应很高，得到 {del_snr['signal']:.3f}"
+
+
+def test_ema_checkpoint_roundtrip_keeps_weights():
+    """EMA 权重必须真的存进 checkpoint。
+
+    回归测试：EMA.__init__ 会把副本所有参数的 requires_grad 置为 False，而
+    trainable_state_dict 正是用 requires_grad 判定"哪些不是冻结骨干"。在副本上
+    这个判据恒为 False，曾导致存出的 ema 只剩 normalizer 的 3 个 buffer、
+    没有任何权重 —— 训练中的评测照常（它直接用 EMA 对象），但事后所有
+    从 checkpoint 做的评测和消融全部载入失败。
+    """
+    torch.manual_seed(0)
+
+    class Toy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.frozen = torch.nn.Linear(4, 4)      # 冒充冻结骨干
+            self.head = torch.nn.Linear(4, 2)        # 可训练
+            self.register_buffer("stat", torch.ones(2))
+            for p in self.frozen.parameters():
+                p.requires_grad_(False)
+
+    online = Toy()
+    ema = EMA(online, decay=0.9)
+    with torch.no_grad():
+        online.head.weight.add_(1.0)
+    ema.update(online)
+
+    sd = trainable_state_dict(ema.ema_model, reference=online)
+    assert "head.weight" in sd, f"EMA 权重丢失，只存下了 {sorted(sd)}"
+    assert not any(k.startswith("frozen.") for k in sd), "冻结骨干不该被存进去"
+    assert "stat" in sd, "buffer 必须保留"
+
+    # 存下的键集合必须和在线模型一致，否则两边评测口径不同
+    assert set(sd) == set(trainable_state_dict(online))
+
+    # 能原样载回，且数值就是 EMA 的值而不是随机初始化
+    fresh = Toy()
+    load_trainable_state_dict(fresh, sd)
+    torch.testing.assert_close(fresh.head.weight, ema.ema_model.head.weight)
+
+
+def test_trainable_state_dict_refuses_to_save_nothing():
+    """传错 reference 时必须响亮失败，而不是静默存出一个空 checkpoint。"""
+    model = torch.nn.Linear(3, 3)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    with pytest.raises(AssertionError, match="没有任何可训练参数"):
+        trainable_state_dict(model)

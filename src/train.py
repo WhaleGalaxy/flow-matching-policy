@@ -152,7 +152,7 @@ def main(cfg: DictConfig) -> None:
                 ckpt = out_dir / f"ckpt_{step}.pt"
                 torch.save({"step": step, "cfg": OmegaConf.to_container(cfg, resolve=True),
                             "model": trainable_state_dict(policy),
-                            "ema": trainable_state_dict(ema.ema_model)}, ckpt)
+                            "ema": trainable_state_dict(ema.ema_model, reference=policy)}, ckpt)
                 print(f"  已保存 {ckpt.name}", flush=True)
 
                 if cfg.eval.n_episodes > 0:

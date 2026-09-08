@@ -274,15 +274,23 @@ class DDPMPolicy(nn.Module):
         return self.normalizer.denormalize(x)
 
 
-def trainable_state_dict(model: nn.Module) -> dict:
+def trainable_state_dict(model: nn.Module, reference: nn.Module | None = None) -> dict:
     """只保留可训练参数和全部 buffer，丢掉冻结的骨干权重。
 
     完整 state_dict 里 99% 是冻结的 DINOv2 + SigLIP 权重（单个 checkpoint 1.1GB），
     它们完全由 timm/HF 的预训练标识决定，重新加载即可，没必要随每个 checkpoint 存一份。
     buffer 必须保留 —— 归一化统计量和噪声调度都在里面。
+
+    `reference` 指定用谁来判定"哪些参数是可训练的"。默认用 `model` 自己，但保存
+    **EMA 副本**时必须显式传入在线模型：`EMA.__init__` 会把副本所有参数的
+    requires_grad 置为 False，拿副本自己判定会得到空集，于是全部权重被误当成
+    冻结骨干丢掉，存出一个只剩 buffer 的空 checkpoint。
     """
-    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    ref = model if reference is None else reference
+    trainable = {n for n, p in ref.named_parameters() if p.requires_grad}
     buffers = {n for n, _ in model.named_buffers()}
+    assert trainable, (
+        "没有任何可训练参数被选中 —— 若在保存 EMA 副本，需传入 reference=在线模型")
     return {k: v.detach().cpu() for k, v in model.state_dict().items()
             if k in trainable or k in buffers}
 
