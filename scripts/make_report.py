@@ -21,6 +21,12 @@ COLOR = {"bc": "#8B8B8B", "ddpm": "#C4682B", "fm": "#378ADD",
 ORDER = ("bc", "ddpm", "fm", "fm/multi")
 
 
+def order_of(methods) -> list:
+    """ORDER 里的先排前面，其余（如 --weights both 产生的 /online 变体）按名字跟后。"""
+    known = [m for m in ORDER if m in methods]
+    return known + sorted(m for m in methods if m not in ORDER)
+
+
 def prepare(df: pd.DataFrame) -> pd.DataFrame:
     """加上区分实验条件的列，并去掉重复评测。
 
@@ -34,6 +40,7 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
        实验条件平均掉。
     """
     df = df.copy()
+    df["ema"] = df.ema.astype(str).str.lower().isin(("true", "1"))
     df["run"] = df.ckpt.map(lambda c: Path(c).parent.name)
     df["multitask"] = df.run.str.contains(r"\+", regex=True)
     df["method"] = df.model.where(~df.multitask, df.model + "/multi")
@@ -56,7 +63,7 @@ def main_table(df: pd.DataFrame) -> str:
     tasks = [t for t in SHORT if t in set(a.task)]
     lines = ["| Method | " + " | ".join(SHORT[t] for t in tasks) + " |",
              "|---|" + "---|" * len(tasks)]
-    for m in ORDER:
+    for m in order_of(set(a.method)):
         sub = a[a.method == m]
         if sub.empty:
             continue
@@ -65,7 +72,8 @@ def main_table(df: pd.DataFrame) -> str:
             r = sub[sub.task == t]
             cells.append(f"{100*r['mean'].iloc[0]:.0f}±{100*r['std'].iloc[0]:.0f}%"
                          if not r.empty else "—")
-        name = f"**{LABEL[m]}**" if m == "fm" else LABEL[m]
+        label = LABEL.get(m, LABEL.get(m.split("/")[0], m) + " · online")
+        name = f"**{label}**" if m == "fm" else label
         lines.append(f"| {name} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
@@ -78,7 +86,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path):
     base = df[(df.n_steps.isin([10, 100])) & (df.guidance == 1.0)]
     a = agg(base)
     tasks = [t for t in SHORT if t in set(a.task)]
-    models = [m for m in ORDER if m in set(a.method)]
+    models = order_of(set(a.method))
     if tasks and models:
         fig, ax = plt.subplots(figsize=(7, 4))
         w = 0.8 / len(models)
@@ -87,7 +95,8 @@ def plot_all(df: pd.DataFrame, out_dir: Path):
             xs = [j + i * w - 0.4 + w / 2 for j in range(len(tasks))]
             ys = [100 * sub.loc[t, "mean"] if t in sub.index else 0 for t in tasks]
             es = [100 * sub.loc[t, "std"] if t in sub.index else 0 for t in tasks]
-            ax.bar(xs, ys, w * 0.9, yerr=es, capsize=3, label=LABEL[m], color=COLOR[m])
+            ax.bar(xs, ys, w * 0.9, yerr=es, capsize=3,
+                   label=LABEL.get(m, m), color=COLOR.get(m, "#666"))
         ax.set_xticks(range(len(tasks))); ax.set_xticklabels([SHORT[t] for t in tasks])
         ax.set_ylabel("Success rate (%)"); ax.set_ylim(0, 100)
         ax.legend(); ax.grid(axis="y", alpha=0.3); ax.set_axisbelow(True)
@@ -107,11 +116,13 @@ def plot_all(df: pd.DataFrame, out_dir: Path):
                     color=COLOR.get(m, "#666"),
                     ls="--" if m == "ddpm" else "-",
                     label=f"{LABEL.get(m,m)} · {SHORT.get(t,t)}")
-        ax.set_xscale("log"); ax.set_xlabel("Sampling steps")
-        ax.set_ylabel("Success rate (%)"); ax.grid(alpha=0.3)
-        ax.legend(fontsize=8); ax.set_title("Quality vs. sampling steps")
-        plt.tight_layout(); p = out_dir / "results_steps.png"
-        plt.savefig(p, dpi=140); figs.append(p); plt.close()
+        if ax.get_lines():
+            ax.set_xscale("log"); ax.set_xlabel("Sampling steps")
+            ax.set_ylabel("Success rate (%)"); ax.grid(alpha=0.3)
+            ax.legend(fontsize=8); ax.set_title("Quality vs. sampling steps")
+            plt.tight_layout(); p = out_dir / "results_steps.png"
+            plt.savefig(p, dpi=140); figs.append(p)
+        plt.close()
 
     # --- 图3：CFG 权重消融 ---
     gw = df[df.guidance.notna()].groupby(["task", "guidance"])["success_rate"].mean().reset_index()
@@ -120,10 +131,12 @@ def plot_all(df: pd.DataFrame, out_dir: Path):
         for t, grp in gw.groupby("task"):
             grp = grp.sort_values("guidance")
             ax.plot(grp.guidance, 100 * grp.success_rate, "o-", label=SHORT.get(t, t))
-        ax.set_xlabel("CFG guidance weight w"); ax.set_ylabel("Success rate (%)")
-        ax.grid(alpha=0.3); ax.legend(); ax.set_title("Classifier-free guidance ablation")
-        plt.tight_layout(); p = out_dir / "results_cfg.png"
-        plt.savefig(p, dpi=140); figs.append(p); plt.close()
+        if ax.get_lines():
+            ax.set_xlabel("CFG guidance weight w"); ax.set_ylabel("Success rate (%)")
+            ax.grid(alpha=0.3); ax.legend(); ax.set_title("Classifier-free guidance ablation")
+            plt.tight_layout(); p = out_dir / "results_cfg.png"
+            plt.savefig(p, dpi=140); figs.append(p)
+        plt.close()
 
     return figs
 
@@ -132,13 +145,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", type=Path, default=Path("outputs/results.csv"))
     ap.add_argument("--out-dir", type=Path, default=Path("docs/figures"))
+    # 最终评测对每个 checkpoint 同时跑了 EMA 与在线权重。两者绝不能混在一起
+    # 聚合——那等于把两个不同的推理配置平均掉。默认只报 EMA。
+    ap.add_argument("--weights", choices=("ema", "online", "both"), default="ema",
+                    help="用哪套权重的评测结果出表（默认 ema）")
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv)
     df["success_rate"] = df.success_rate.astype(float)
     n_raw = len(df)
     df = prepare(df)
-    print(f"{n_raw} 条评测记录，去重后 {len(df)} 条\n")
+    if args.weights == "ema":
+        df = df[df.ema]
+    elif args.weights == "online":
+        df = df[~df.ema]
+    else:
+        df = df.copy()
+        df["method"] = df.method.where(df.ema, df.method + "/online")
+    assert not df.empty, f"CSV 里没有 weights={args.weights} 的评测记录"
+    print(f"{n_raw} 条评测记录，去重并按 weights={args.weights} 筛选后 {len(df)} 条\n")
     print("主结果表：\n")
     print(main_table(df))
     figs = plot_all(df, args.out_dir)
