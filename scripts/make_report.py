@@ -44,8 +44,16 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     df["run"] = df.ckpt.map(lambda c: Path(c).parent.name)
     df["multitask"] = df.run.str.contains(r"\+", regex=True)
     df["method"] = df.model.where(~df.multitask, df.model + "/multi")
-    return df.drop_duplicates(
-        subset=["ckpt", "task", "n_steps", "guidance", "ema"], keep="first")
+    key = ["ckpt", "task", "n_steps", "guidance", "ema"]
+    dup = df[df.duplicated(subset=key, keep="last")]
+    if not dup.empty:
+        # keep="last"，不是 first：同一 checkpoint+配置被重复评测时，后写入的那次
+        # 才是本轮的结果。run_name 会跨轮复用（fm_PickCube_s42），所以上一轮遗留在
+        # results.csv 里的行与本轮的键完全相同 —— 保留 first 会让主结果表显示上一轮
+        # 的数字，而且从表面完全看不出来。
+        print(f"注意：{len(dup)} 行被更晚的同键评测取代（旧值 "
+              f"{', '.join(f'{r.success_rate:.0%}' for r in dup.itertuples())}）\n")
+    return df.drop_duplicates(subset=key, keep="last")
 
 
 def agg(df):
@@ -195,6 +203,14 @@ def main():
         df["method"] = df.method.where(df.ema, df.method + "/online")
     assert not df.empty, f"CSV 里没有 weights={args.weights} 的评测记录"
     print(f"{n_raw} 条评测记录，去重并按 weights={args.weights} 筛选后 {len(df)} 条\n")
+
+    # 主结果表的每一格都标称"100 episode"。混入不同 episode 数意味着表里并排的
+    # 数字来自不同可信度的测量 —— 通常是上一轮遗留在 results.csv 里的行。
+    base = df[(df.n_steps.isin([10, 100])) & (df.guidance == 1.0)]
+    if base.n_episodes.nunique() > 1:
+        counts = base.n_episodes.value_counts().to_dict()
+        print(f"警告：主结果表混入了不同的 episode 数 {counts}，"
+              f"并排的数字可信度不一致。多半是上一轮的遗留行，请检查 {args.csv}\n")
     print("主结果表：\n")
     print(main_table(df))
     figs = plot_all(df, args.out_dir)
