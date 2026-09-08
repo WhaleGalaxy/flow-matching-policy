@@ -90,7 +90,8 @@ def main():
                         r = rollout(policy, env, task, n_episodes=args.n_episodes,
                                     obs_horizon=cfg["obs_horizon"],
                                     execute_horizon=cfg["eval"]["execute_horizon"],
-                                    img_size=cfg["img_size"], n_steps=s, guidance=g)
+                                    img_size=cfg["img_size"], n_steps=s, guidance=g,
+                                    use_goal=cfg.get("use_goal", False))
                         print(f"  {task:22s} steps={s:<4} w={g:<4} "
                               f"SR {100*r['success_rate']:5.1f}%  "
                               f"步长 {r['mean_length']:5.1f}  "

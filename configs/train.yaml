@@ -26,6 +26,12 @@ bf16: true
 
 # ---- 模型共享超参 ----
 use_proprio: true
+# 把 obs/extra/goal_pos 接进 proprio（proprio_dim 9 → 12）。
+# PickCube 的目标位置每局随机，且**在 base_camera 里不可见**（线性探针 R²≈-0.1，
+# 而方块位置 R²=0.96）。不接入的话策略无从知道该把方块放到哪里，
+# 抓取率 95% 但成功率只有 6%。默认 false 是为了让已发布的结果可复现。
+# StackCube / PegInsertion 的 obs 里没有 goal_pos，开启会 assert。
+use_goal: false
 
 # ---- 评测 ----
 eval:

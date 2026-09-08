@@ -31,7 +31,8 @@ from src.models.policy import (BCPolicy, DDPMPolicy, EMA, FMPolicy,  # noqa: E40
 
 def build_dataset(cfg):
     kw = dict(obs_horizon=cfg.obs_horizon, act_horizon=cfg.act_horizon,
-              img_size=cfg.img_size, max_episodes=cfg.max_episodes)
+              img_size=cfg.img_size, max_episodes=cfg.max_episodes,
+              use_goal=cfg.get("use_goal", False))
     tasks = list(cfg.tasks)
     if len(tasks) == 1:
         ds = ManiskillDataset(default_h5_path(tasks[0]), task=tasks[0], **kw)
@@ -167,7 +168,8 @@ def main(cfg: DictConfig) -> None:
                                         execute_horizon=cfg.eval.execute_horizon,
                                         img_size=cfg.img_size,
                                         n_steps=cfg.model.get("n_sample_steps", 10),
-                                        guidance=cfg.eval.get("guidance", 1.0))
+                                        guidance=cfg.eval.get("guidance", 1.0),
+                                        use_goal=cfg.get("use_goal", False))
                         finally:
                             env.close()
                         scores[task] = r["success_rate"]

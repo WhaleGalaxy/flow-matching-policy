@@ -20,7 +20,7 @@ def _np(x):
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.data.dataset import (CONTROL_MODE, TASK_INSTRUCTIONS,  # noqa: E402
-                              preprocess_obs_rgb)
+                              build_proprio, preprocess_obs_rgb)
 
 
 # 评测环境的控制模式**必须**与训练数据一致，且必须显式指定 ——
@@ -54,6 +54,7 @@ def rollout(
     max_steps: int = 300,
     seed: int = 0,
     record_frames: bool = False,
+    use_goal: bool = False,
 ) -> dict:
     device = next(policy.parameters()).device
     instruction = TASK_INSTRUCTIONS[task]
@@ -68,10 +69,12 @@ def rollout(
 
         def push(o):
             rgb = o["sensor_data"][camera]["rgb"][0]        # (128,128,3) uint8
-            qpos = o["agent"]["qpos"][0]                     # (9,)
+            # proprio 的组装必须与训练完全一致，走同一个 build_proprio
+            prop = build_proprio(_np(o["agent"]["qpos"][0]),
+                                 _np(o["extra"]["goal_pos"][0]) if use_goal else None)
             while len(rgb_hist) < obs_horizon:
-                rgb_hist.append(rgb); prop_hist.append(qpos)
-            rgb_hist.append(rgb); prop_hist.append(qpos)
+                rgb_hist.append(rgb); prop_hist.append(prop)
+            rgb_hist.append(rgb); prop_hist.append(prop)
 
         push(obs)
         success, t = False, 0
