@@ -28,7 +28,7 @@ RGB (2帧, 128×128)  ──► DINOv2-S (冻结) ──► 81 个 patch token �
 语言指令             ──► SigLIP 文本塔(冻结) ──► 1 个 token ────┼─► context (B, 83, 256)
 关节角 + 夹爪 (9维)  ──► MLP ─────────────► 1 个 token ────┘         │
                                                                       │ cross-attn
-噪声动作块 x_t (16×8) ──► Transformer denoiser (AdaLN 注入流时间 t) ◄──┘
+噪声动作块 x_t (16×7) ──► Transformer denoiser (AdaLN 注入流时间 t) ◄──┘
                                     │
                                     ▼
                          速度场 v_θ ──► Euler 积分 (10步) ──► 动作块
@@ -36,7 +36,8 @@ RGB (2帧, 128×128)  ──► DINOv2-S (冻结) ──► 81 个 patch token �
 
 - 视觉/语言骨干全部冻结（**99.5% 参数冻结**）：演示只有 1000 条/任务，微调 ViT 必然过拟合
 - denoiser 用 DiT 式设计：AdaLN 注入流时间，残差分支与输出层**零初始化**，起步即恒等映射
-- 推理用 EMA 权重；CFG 的有条件/无条件两路拼成一个 batch，一次前向完成
+- checkpoint 同时保存在线权重与 EMA 权重，用哪套由实测决定而非默认（见下方工程记录）
+- CFG 的有条件/无条件两路拼成一个 batch，一次前向完成
 
 ## Quick Start
 
@@ -44,7 +45,8 @@ RGB (2帧, 128×128)  ──► DINOv2-S (冻结) ──► 81 个 patch token �
 conda create -n robot python=3.10 -y && conda activate robot
 pip install -r requirements.txt
 
-# 若本机 NVIDIA 驱动未装或与显示栈冲突，见 scripts/setup_gpu_headless.sh 与 setup_vulkan.sh
+# 混合显卡笔记本上装驱动会让 Xorg 选错显卡导致开机黑屏，见 docs/gpu-setup.md
+sudo bash scripts/setup_gpu.sh
 
 # 1) 下载并重放演示数据（官方 demo 的 obs/ 是空的，必须重放渲染才有图像）
 bash scripts/download_demos.sh
@@ -58,9 +60,13 @@ python -m src.train tasks="[PickCube-v1,StackCube-v1,PegInsertionSide-v1]"   # �
 
 # 3) 评测与消融（消融复用同一个 checkpoint，无需重训）
 python scripts/run_eval.py --ckpt outputs/fm_PickCube_s42/ckpt_20000.pt --n-episodes 100
+python scripts/run_eval.py --ckpt ... --n-episodes 100 --no-ema      # 在线权重对照
 python scripts/run_eval.py --ckpt ... --sweep-steps 1 2 5 10 20
 python scripts/run_eval.py --ckpt ... --sweep-guidance 1.0 1.5 2.0
-python scripts/make_report.py
+python scripts/make_report.py --weights ema                          # 或 online / both
+
+# 成功率在低分区间没有分辨率时，用连续指标判断策略是否在学
+python scripts/diagnose_rollout.py --ckpt outputs/fm_PickCube_s42/ckpt_20000.pt
 
 # 4) 推理延迟基准
 python scripts/benchmark_inference.py
@@ -77,7 +83,10 @@ python scripts/benchmark_inference.py
 | 发现 | 说明 |
 |---|---|
 | DINOv2 输入不能是 96×96 | patch 是 14×14，96 除不尽。改用 126×126 → 81 个 patch |
-| ManiSkill3 动作是 8 维 | Panda 7 关节 + 1 夹爪，不是 7 维 |
+| 动作表示决定成败 | `pd_joint_pos` 下 98.4% 的动作方差只由"手臂当前在哪"决定，任务信号仅 1.6%，成功率锁死在 4%。换成 `pd_ee_delta_pose` 后任务信号升至 57–74%（约 40 倍），策略才学会接近与抓取。详见 [docs/debugging.md](docs/debugging.md) |
+| 动作维度随控制模式变 | `pd_joint_pos` 是 8 维（Panda 7 关节 + 夹爪），`pd_ee_delta_pose` 是 7 维（6 自由度增量 + 夹爪） |
+| 成功率在低分区间读不出趋势 | 25 个 episode 下 8% 和 4% 只差一次成功，置信区间几乎重合。用 TCP→目标距离、抓取率这类连续量判断，10 个 episode 即可定论（`scripts/diagnose_rollout.py`） |
+| EMA 未必更好 | `decay=0.9999` 的时间常数是 10000 步，对 20000 步的训练太慢，实测在线权重的抓取率 80% vs EMA 45%。两套权重都存进 checkpoint，评测时再选 |
 | 官方 demo 的 `obs/` 是空的 | 采集时 `obs_mode="none"`，必须重放渲染才有图像观测 |
 | BF16 不需要 GradScaler | GradScaler 是给 FP16 防梯度下溢的；BF16 指数位与 FP32 相同，不会下溢 |
 | FM 的 loss 不会趋近 0 | 下界是条件方差 `E[Var(x₁−x₀｜x_t,t,ctx)]`，不能拿"loss < 0.1"当验收标准 |
@@ -108,7 +117,7 @@ fm_policy/
 │   └── evaluate.py       # rollout 与成功率统计
 ├── scripts/          # 环境搭建、数据重放、评测、报告、延迟基准
 ├── notebooks/        # 逐步验证实验（玩具 FM、编码器选型、多模态论证）
-├── docs/             # Flow Matching 推导笔记
+├── docs/             # 推导笔记 / 调试记录 / GPU 配置排查
 └── tests/            # pytest 单元测试
 ```
 
