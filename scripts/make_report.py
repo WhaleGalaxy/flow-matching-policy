@@ -14,13 +14,36 @@ import pandas as pd
 
 SHORT = {"PickCube-v1": "PickCube", "StackCube-v1": "StackCube",
          "PegInsertionSide-v1": "PegInsertion"}
-LABEL = {"bc": "BC", "ddpm": "Diffusion Policy", "fm": "FM (Ours)"}
-COLOR = {"bc": "#8B8B8B", "ddpm": "#C4682B", "fm": "#378ADD"}
+LABEL = {"bc": "BC", "ddpm": "Diffusion Policy", "fm": "FM (Ours)",
+         "fm/multi": "FM (Ours, multi-task)"}
+COLOR = {"bc": "#8B8B8B", "ddpm": "#C4682B", "fm": "#378ADD",
+         "fm/multi": "#1F5C99"}
+ORDER = ("bc", "ddpm", "fm", "fm/multi")
+
+
+def prepare(df: pd.DataFrame) -> pd.DataFrame:
+    """加上区分实验条件的列，并去掉重复评测。
+
+    两件必须先做的事，否则主结果表是错的：
+
+    1. 消融是复用同一个 checkpoint 跑的，`--sweep-steps 1 2 5 10 20` 里 n_steps=10
+       那行、`--sweep-guidance 1.0 1.5 2.0` 里 w=1.0 那行，与主评测行的字段完全
+       相同。不去重的话它们会被 groupby 当成额外的 seed，±std 就不再是种子间方差。
+    2. 单任务 FM 和多任务 FM 的 model 都是 "fm"、task 都含 PickCube-v1，只有
+       checkpoint 路径不同。不区分的话主表里 FM 的 PickCube 一格会把两个不同的
+       实验条件平均掉。
+    """
+    df = df.copy()
+    df["run"] = df.ckpt.map(lambda c: Path(c).parent.name)
+    df["multitask"] = df.run.str.contains(r"\+", regex=True)
+    df["method"] = df.model.where(~df.multitask, df.model + "/multi")
+    return df.drop_duplicates(
+        subset=["ckpt", "task", "n_steps", "guidance", "ema"], keep="first")
 
 
 def agg(df):
-    """按 (模型, 任务) 聚合多个 seed，给出 mean±std。"""
-    g = df.groupby(["model", "task"])["success_rate"]
+    """按 (方法, 任务) 聚合多个 seed，给出 mean±std。"""
+    g = df.groupby(["method", "task"])["success_rate"]
     out = g.agg(["mean", "std", "count"]).reset_index()
     out["std"] = out["std"].fillna(0.0)
     return out
@@ -33,8 +56,8 @@ def main_table(df: pd.DataFrame) -> str:
     tasks = [t for t in SHORT if t in set(a.task)]
     lines = ["| Method | " + " | ".join(SHORT[t] for t in tasks) + " |",
              "|---|" + "---|" * len(tasks)]
-    for m in ("bc", "ddpm", "fm"):
-        sub = a[a.model == m]
+    for m in ORDER:
+        sub = a[a.method == m]
         if sub.empty:
             continue
         cells = []
@@ -55,12 +78,12 @@ def plot_all(df: pd.DataFrame, out_dir: Path):
     base = df[(df.n_steps.isin([10, 100])) & (df.guidance == 1.0)]
     a = agg(base)
     tasks = [t for t in SHORT if t in set(a.task)]
-    models = [m for m in ("bc", "ddpm", "fm") if m in set(a.model)]
+    models = [m for m in ORDER if m in set(a.method)]
     if tasks and models:
         fig, ax = plt.subplots(figsize=(7, 4))
         w = 0.8 / len(models)
         for i, m in enumerate(models):
-            sub = a[a.model == m].set_index("task")
+            sub = a[a.method == m].set_index("task")
             xs = [j + i * w - 0.4 + w / 2 for j in range(len(tasks))]
             ys = [100 * sub.loc[t, "mean"] if t in sub.index else 0 for t in tasks]
             es = [100 * sub.loc[t, "std"] if t in sub.index else 0 for t in tasks]
@@ -73,14 +96,14 @@ def plot_all(df: pd.DataFrame, out_dir: Path):
         plt.savefig(p, dpi=140); figs.append(p); plt.close()
 
     # --- 图2：采样步数 vs 成功率 ---
-    sw = df[(df.guidance == 1.0)].groupby(["model", "task", "n_steps"])["success_rate"].mean().reset_index()
+    sw = df[(df.guidance == 1.0)].groupby(["method", "task", "n_steps"])["success_rate"].mean().reset_index()
     if sw.n_steps.nunique() > 1:
         fig, ax = plt.subplots(figsize=(6, 4))
-        for (m, t), grp in sw.groupby(["model", "task"]):
+        for (m, t), grp in sw.groupby(["method", "task"]):
             if len(grp) < 2:
                 continue
             grp = grp.sort_values("n_steps")
-            ax.plot(grp.n_steps, 100 * grp.success_rate, "o-",
+            ax.plot(grp.n_steps, 100 * grp.success_rate, "o",
                     color=COLOR.get(m, "#666"),
                     ls="--" if m == "ddpm" else "-",
                     label=f"{LABEL.get(m,m)} · {SHORT.get(t,t)}")
@@ -113,7 +136,9 @@ def main():
 
     df = pd.read_csv(args.csv)
     df["success_rate"] = df.success_rate.astype(float)
-    print(f"{len(df)} 条评测记录\n")
+    n_raw = len(df)
+    df = prepare(df)
+    print(f"{n_raw} 条评测记录，去重后 {len(df)} 条\n")
     print("主结果表：\n")
     print(main_table(df))
     figs = plot_all(df, args.out_dir)
