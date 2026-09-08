@@ -62,6 +62,15 @@ def rollout(
 
     successes, lengths, frames = [], [], []
     for ep in range(n_episodes):
+        # 固定采样噪声。这消除了一个方差来源，但**评测仍然不是 bit 级可复现的**：
+        # 注意力的 SDPA 后端按启发式在 flash / mem-efficient 之间切换，带来 1e-6
+        # 量级的数值差异，而 rollout 是闭环 —— 动作末位的差异改变仿真状态，
+        # 几百步后轨迹完全不同。实测同一 checkpoint 重测的波动约 1 个百分点
+        # （n=100），大于本项目各方法之间的差距。
+        #
+        # 结论不是去追求 bit 级确定性（要 use_deterministic_algorithms 且明显变慢），
+        # 而是：成功率在个位数区间不足以支撑结论，用 diagnose_rollout.py 的连续指标。
+        torch.manual_seed(seed + ep)
         obs, _ = env.reset(seed=seed + ep)
         # 观测窗口：起始时用第一帧重复填满
         rgb_hist = deque(maxlen=obs_horizon)
