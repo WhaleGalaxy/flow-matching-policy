@@ -44,16 +44,22 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     df["run"] = df.ckpt.map(lambda c: Path(c).parent.name)
     df["multitask"] = df.run.str.contains(r"\+", regex=True)
     df["method"] = df.model.where(~df.multitask, df.model + "/multi")
-    key = ["ckpt", "task", "n_steps", "guidance", "ema"]
-    dup = df[df.duplicated(subset=key, keep="last")]
-    if not dup.empty:
-        # keep="last"，不是 first：同一 checkpoint+配置被重复评测时，后写入的那次
-        # 才是本轮的结果。run_name 会跨轮复用（fm_PickCube_s42），所以上一轮遗留在
-        # results.csv 里的行与本轮的键完全相同 —— 保留 first 会让主结果表显示上一轮
-        # 的数字，而且从表面完全看不出来。
-        print(f"注意：{len(dup)} 行被更晚的同键评测取代（旧值 "
-              f"{', '.join(f'{r.success_rate:.0%}' for r in dup.itertuples())}）\n")
-    return df.drop_duplicates(subset=key, keep="last")
+    # 同一 checkpoint+配置可能被评测多次（主评测、步数消融的 10 步、CFG 消融的
+    # w=1.0 会落在同一个键上）。这些是对同一个量的重复测量，**取平均**而不是
+    # 任选一次 —— 实测同配置三次得到 4% / 5% / 7%，选最后一次等于让结果表取决于
+    # 脚本的执行顺序。n_episodes 也进分组键，样本量不同的测量不会被混在一起。
+    key = ["ckpt", "task", "n_steps", "guidance", "ema",
+           "method", "model", "seed", "run", "multitask", "n_episodes"]
+    g = df.groupby(key, as_index=False).agg(
+        success_rate=("success_rate", "mean"),
+        spread=("success_rate", lambda x: x.max() - x.min()),
+        n_evals=("success_rate", "size"))
+    rep = g[g.n_evals > 1]
+    if not rep.empty:
+        worst = rep.spread.max()
+        print(f"注意：{int(rep.n_evals.sum())} 次评测被合并为 {len(rep)} 个配置的均值；"
+              f"同配置重复测量的最大跨度 {worst:.0%}（这是成功率的测量噪声下限）\n")
+    return g
 
 
 def agg(df):
