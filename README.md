@@ -90,6 +90,7 @@ python scripts/benchmark_inference.py
 | 官方 demo 的 `obs/` 是空的 | 采集时 `obs_mode="none"`，必须重放渲染才有图像观测 |
 | BF16 不需要 GradScaler | GradScaler 是给 FP16 防梯度下溢的；BF16 指数位与 FP32 相同，不会下溢 |
 | FM 的 loss 不会趋近 0 | 下界是条件方差 `E[Var(x₁−x₀｜x_t,t,ctx)]`，不能拿"loss < 0.1"当验收标准 |
+| FM 与 DDPM 的 loss 不可比 | FM 回归速度场 `x₁−x₀`，DDPM 回归噪声 `ε`，目标不同、方差下界也不同。实测 DDPM 收敛在 0.05、FM 在 0.18，但这**不表示** DDPM 学得更好——只能比成功率 |
 | TF32 默认是关的 | torch 2.x 里 matmul 的 TF32 默认关闭，打开实测有 1.3–2.9x 加速 |
 | checkpoint 曾达 1.1GB | 冻结骨干被存了两份；只存可训练参数后降到 27MB |
 
