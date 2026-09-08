@@ -59,8 +59,12 @@ class ActionNormalizer(nn.Module):
 class BCPolicy(nn.Module):
     """行为克隆基线：context 池化后过 MLP，直接回归整个动作块。
 
-    刻意与 FM 共用同一套编码器和相近的参数量，这样 FM vs BC 的差异
-    只来自建模方式（确定性回归 vs 生成式流匹配），而不是模型容量。
+    与 FM 共用同一套编码器。但**默认配置下并非等参数量**：hidden=1024 时
+    可训练参数 1.77M，而 FM/DDPM 是 6.80M（3.8 倍差距）。所以 FM vs BC 的
+    差异里混有容量因素，不能单独归因于"确定性回归 vs 生成式流匹配"。
+
+    要做等容量对照请用 hidden=2364（6.81M）。真正做到同骨干、同参数量的
+    受控对比是 FM vs DDPM —— 两者都是 6.80M，编码器与 denoiser 结构完全相同。
     """
 
     def __init__(self, d_model=256, act_dim=7, act_horizon=16,

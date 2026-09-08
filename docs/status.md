@@ -14,7 +14,7 @@
 | 理论笔记 | ✅ | `docs/flow_matching.md` |
 | 编码器 | ✅ | DINOv2 / SigLIP / Proprio，冻结 99.5% 参数 |
 | FM Denoiser | ✅ | AdaLN + cross-attn + 零初始化，6.45M |
-| FMPolicy / DDPMPolicy / BCPolicy | ✅ | 同骨干同参数量（6.80M），对比可控 |
+| FMPolicy / DDPMPolicy / BCPolicy | ⚠️ | FM 与 DDPM 同骨干同参数量（均 6.80M）；**BC 默认只有 1.77M，并非等容量**，见下 |
 | EMA / CFG / Euler & DDIM 采样 | ✅ | |
 | 训练脚本 | ✅ | Hydra + BF16 + 训练前检查 + 周期评测 |
 | 评测 / 消融 / 报告脚本 | ✅ | 消融复用 checkpoint，无需重训 |
@@ -169,3 +169,30 @@ python -m src.train tasks=[PegInsertionSide-v1]
 
 在此之前，README 里不应把 StackCube/PegInsertion 的 0% 表述成"方法在这些任务上无效" ——
 现有证据只支持"在多任务、20000 步、单相机的条件下未能学会"。
+
+
+## BC 基线并非等参数量（2026-09-09）
+
+`BCPolicy` 的 docstring 写着"刻意与 FM 共用同一套编码器和相近的参数量……差异只来自
+建模方式，而不是模型容量"。这个意图没有达成：
+
+| 模型 | 可训练参数 |
+|---|---|
+| FM | 6.80M |
+| DDPM | 6.80M |
+| **BC** | **1.77M** |
+
+差 3.8 倍。BC 的 head 是 `256→1024→1024→112` 的 MLP（约 1.43M），而 FM/DDPM 的
+denoiser 是 6.46M；两者共用的编码器投影层都是 0.34M。
+
+**影响范围**：项目的核心受控对比是 **FM vs DDPM**（少步流匹配 vs 百步扩散），
+这一对确实是同骨干、同参数量、同训练预算，结论不受影响。受影响的是 FM vs BC ——
+该差异里混有容量因素，不能单独归因于"确定性回归 vs 生成式流匹配"。
+
+**修法**：`hidden` 已做成可配置，默认仍是 1024（保证已有结果可复现）。等容量对照用
+
+```bash
+python -m src.train model=bc model.hidden=2364   # 6.81M，与 FM 相差 +0.2%
+```
+
+在补跑这一轮之前，README 里 BC 那一行应注明参数量，不应让读者以为是等容量对照。

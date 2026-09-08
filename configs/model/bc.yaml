@@ -1,2 +1,6 @@
 name: bc
 d_model: 256
+# 注意：hidden=1024 时可训练参数为 1.77M，而 FM/DDPM 是 6.80M —— 并非等容量。
+# 要做等参数量的 BC 对照，用 model.hidden=2364（6.81M，偏差 +0.2%）。
+# 默认保留 1024 是为了让已发布的结果可复现，见 docs/status.md。
+hidden: 1024

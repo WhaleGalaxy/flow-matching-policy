@@ -44,7 +44,7 @@ def build_policy(cfg, act_dim, proprio_dim):
                   proprio_dim=proprio_dim, use_proprio=cfg.use_proprio,
                   d_model=cfg.model.d_model)
     if cfg.model.name == "bc":
-        return BCPolicy(**common)
+        return BCPolicy(hidden=cfg.model.get("hidden", 1024), **common)
     gen = dict(n_layers=cfg.model.n_layers, n_heads=cfg.model.n_heads,
                cfg_dropout=cfg.model.get("cfg_dropout", 0.2), **common)
     if cfg.model.name == "ddpm":

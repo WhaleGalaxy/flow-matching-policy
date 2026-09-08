@@ -15,6 +15,9 @@
   最优解是这些动作的**条件均值**，而均值往往是非法动作。
   [实测](notebooks/w1_overfit_and_multimodal.py)：双模态目标下 FM 覆盖两个模态 100%，
   BC 覆盖 0%（输出恒为两模态的中点）。
+- **基线的可比性**：FM 与 DDPM 是严格受控对比 —— 同编码器、同 denoiser 结构、
+  同参数量（均 6.80M）、同训练预算，唯一变量是建模目标。BC 共用编码器但 head 是
+  MLP，默认参数量只有 1.77M，**不是等容量对照**（等容量需 `model.hidden=2364`）。
 - **为什么不用扩散（DDPM）**：Flow Matching 回归的条件速度场是**常数** `x₁ − x₀`，
   条件路径为直线，因此少步 Euler 积分即可采样，而 DDPM 通常需要 100 步。
   本仓库实现了**同骨干、同参数量**的 DDPM 基线，把延迟差异归因到建模选择本身。
@@ -92,7 +95,7 @@ python scripts/benchmark_inference.py
 | FM 的 loss 不会趋近 0 | 下界是条件方差 `E[Var(x₁−x₀｜x_t,t,ctx)]`，不能拿"loss < 0.1"当验收标准 |
 | FM 与 DDPM 的 loss 不可比 | FM 回归速度场 `x₁−x₀`，DDPM 回归噪声 `ε`，目标不同、方差下界也不同。实测 DDPM 收敛在 0.05、FM 在 0.18，但这**不表示** DDPM 学得更好——只能比成功率 |
 | TF32 默认是关的 | torch 2.x 里 matmul 的 TF32 默认关闭，打开实测有 1.3–2.9x 加速 |
-| checkpoint 曾达 1.1GB | 冻结骨干被存了两份；只存可训练参数后降到 27MB |
+| checkpoint 曾达 1.1GB | 冻结骨干被存了两份；只存可训练参数后降到 52MB（在线 26MB + EMA 26MB）。此前记录的 27MB 是 EMA 存空时量到的 |
 
 ## 已知局限
 
