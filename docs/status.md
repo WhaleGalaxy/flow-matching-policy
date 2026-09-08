@@ -9,7 +9,7 @@
 | 模块 | 状态 | 备注 |
 |---|---|---|
 | 环境 | ✅ | conda `robot` (py3.10) + torch 2.5.1+cu121，RTX 4060 8GB 可用 |
-| GPU 驱动 | ✅ | headless 计算栈 + Vulkan ICD，显示栈未受影响 |
+| GPU 驱动 | ✅ | 计算栈 + Vulkan ICD，屏蔽 `nvidia_drm` 保住显示栈，见 `docs/gpu-setup.md` |
 | 理论笔记 | ✅ | `docs/flow_matching.md` |
 | 编码器 | ✅ | DINOv2 / SigLIP / Proprio，冻结 99.5% 参数 |
 | FM Denoiser | ✅ | AdaLN + cross-attn + 零初始化，6.45M |
@@ -43,9 +43,6 @@
 ```bash
 conda activate robot
 cd ~/flow_matching/fm_policy
-
-# 0) GPU 模块每次重启后需重新加载
-sudo modprobe nvidia nvidia_uvm && nvidia-smi
 
 # 1) 数据已就绪（三任务已转换并校验，无需重跑）
 
@@ -89,8 +86,9 @@ python scripts/make_report.py                                            # 汇�
 
 ## 已知遗留
 
-- `outputs/fm_PickCube_s42/` 下是第一轮（pd_joint_pos）的 checkpoint，
-  每个 1.1GB 且已无用，可以删掉；后续 checkpoint 已降到 27MB。
+- 第一轮（pd_joint_pos）的 checkpoint 已归档到 `outputs/archive_v1_pd_joint_pos/`
+  ——它和新一轮的 `run_name` 完全同名（`fm_PickCube_s42`），不挪走会新旧混在一个
+  目录里。每个 1.1GB，确认不需要后可整个删掉；后续 checkpoint 已降到 27MB。
 - 旧的 `pd_joint_pos` 数据（约 7.7GB）已无用，可删：
   `rm ~/.maniskill/demos/*/motionplanning/trajectory.rgb.pd_joint_pos.physx_cpu.h5`
   （demo 目录当前占 16GB，磁盘剩余 115GB，不删也不影响）
