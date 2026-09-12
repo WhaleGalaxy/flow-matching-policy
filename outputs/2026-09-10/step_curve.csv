@@ -1,0 +1,6 @@
+ckpt,model,seed,task,n_steps,guidance,ema,n_episodes,success_rate,mean_length
+outputs/fmgoal_PickCube_s42/ckpt_4000.pt,fm,42,PickCube-v1,10,1.0,False,100,0.0600,286.08
+outputs/fmgoal_PickCube_s42/ckpt_8000.pt,fm,42,PickCube-v1,10,1.0,False,100,0.3700,221.13
+outputs/fmgoal_PickCube_s42/ckpt_12000.pt,fm,42,PickCube-v1,10,1.0,False,100,0.5900,164.49
+outputs/fmgoal_PickCube_s42/ckpt_16000.pt,fm,42,PickCube-v1,10,1.0,False,100,0.7000,145.32
+outputs/fmgoal_PickCube_s42/ckpt_20000.pt,fm,42,PickCube-v1,10,1.0,False,100,0.7500,136.74
