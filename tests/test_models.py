@@ -2,6 +2,7 @@
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -164,3 +165,157 @@ def test_trainable_state_dict_refuses_to_save_nothing():
         p.requires_grad_(False)
     with pytest.raises(AssertionError, match="没有任何可训练参数"):
         trainable_state_dict(model)
+
+
+# ---------------------------------------------------------------- DDIM 采样器
+
+def _zero_denoiser(x, t, ctx):
+    """零初始化的 denoiser：FMDenoiser 的输出层就是零初始化的，所以刚建好的
+    模型精确等价于这个函数。用它测采样器本身，不需要真权重。"""
+    return torch.zeros_like(x)
+
+
+def test_ddim_sampler_does_not_amplify_without_clipping_guard():
+    """守一个让整个 DDPM 基线归零的 bug。
+
+    cosine 调度 clamp 了 beta 上限，重新 cumprod 之后 `alphas_cumprod[-1] ≈ 2.4e-7`，
+    比前一项小 1000 倍。采样恰好从这一项起步，`x0_pred = (x − …)/√ᾱ` 会把误差
+    放大约 2029 倍。ε 预测为零时，整条链的净增益正好是 1/√ᾱ_last。
+
+    症状是**所有配置下成功率完全相同**（实测采样步数 1→50、执行长度 1→16 全是
+    2.0%），不会抛异常，只会安静地把基线变成常数输出。
+    """
+    from src.models.policy import DDPMPolicy, ddim_sample
+
+    ac = DDPMPolicy._cosine_schedule(100)
+    assert ac[-1] < ac[-2] / 100, "前提变了：调度末项不再是病态的小值，本测试需重写"
+
+    x0 = torch.randn(4, H, 7)
+    ctx = torch.zeros(4, L, D)
+
+    unclipped = ddim_sample(_zero_denoiser, ac, x0.clone(), 100, 100, ctx, clip_x0=0)
+    gain = unclipped.abs().max() / x0.abs().max()
+    assert gain > 100, f"没有裁剪时本应炸开，实测增益只有 {gain:.1f}"
+
+    clipped = ddim_sample(_zero_denoiser, ac, x0.clone(), 100, 100, ctx, clip_x0=4.0)
+    assert torch.isfinite(clipped).all()
+    assert clipped.abs().max() <= 4.0 + 1e-4, \
+        f"裁剪后仍越界：{clipped.abs().max():.3f}"
+
+
+@pytest.mark.parametrize("n_steps", [1, 2, 10, 100])
+def test_ddim_sampler_bounded_at_every_step_count(n_steps):
+    """少步是这个项目的主张所在，采样器在每个步数下都必须是有界的。"""
+    from src.models.policy import DDPMPolicy, ddim_sample
+
+    ac = DDPMPolicy._cosine_schedule(100)
+    out = ddim_sample(_zero_denoiser, ac, torch.randn(4, H, 7), 100, n_steps,
+                      torch.zeros(4, L, D), clip_x0=4.0)
+    assert torch.isfinite(out).all() and out.abs().max() <= 4.0 + 1e-4
+
+
+def test_checkpoint_roundtrip_preserves_non_default_architecture():
+    """凡是进了模型构造函数的超参，load_policy 都必须从 cfg 读回来。
+
+    实际踩过：BC 的等容量对照用 `hidden=2364`，而 load_policy 忘了读这一项，
+    按默认 1024 建模型，于是所有 BC 评测都在 load_state_dict 处崩掉 ——
+    而它们跑在后台脚本里，CSV 里只是**少了几行**，不看日志发现不了。
+    """
+    from src.models.policy import BCPolicy
+
+    big = BCPolicy(hidden=333, d_model=D, act_dim=7, act_horizon=H, proprio_dim=9)
+    state = trainable_state_dict(big)
+
+    wrong = BCPolicy(hidden=1024, d_model=D, act_dim=7, act_horizon=H, proprio_dim=9)
+    with pytest.raises(RuntimeError):
+        load_trainable_state_dict(wrong, state)
+
+    right = BCPolicy(hidden=333, d_model=D, act_dim=7, act_horizon=H, proprio_dim=9)
+    load_trainable_state_dict(right, state)      # 不应抛异常
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-11 加入的组件：等条件 BC 对照、OT 耦合、目标槽、冻结特征缓存
+# ---------------------------------------------------------------------------
+
+def test_bc_xattn_matches_fm_capacity():
+    """等条件 BC 对照必须与 FM 同参数量，否则差距里又混进容量。
+
+    只允许差一个 query（act_horizon × act_dim 个参数）—— 那是"没有噪声输入"
+    这件事的全部代价。
+    """
+    from src.models.policy import BCXAttnPolicy, FMPolicy
+    fm = FMPolicy(proprio_dim=13)
+    bx = BCXAttnPolicy(proprio_dim=13)
+    n = lambda m: sum(p.numel() for p in m.parameters() if p.requires_grad)
+    assert n(bx) - n(fm) == 16 * 7, (n(bx), n(fm))
+
+
+def test_bc_xattn_forward_and_loss():
+    from src.models.policy import BCXAttnPolicy
+    p = BCXAttnPolicy(proprio_dim=13)
+    p.normalizer.fit(torch.randn(64, 7))
+    batch = dict(rgb=torch.randn(2, 2, 3, 126, 126), proprio=torch.randn(2, 2, 13),
+                 action=torch.randn(2, 16, 7), instruction=["a", "b"])
+    loss = p.compute_loss(batch)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert p.predict_action(batch["rgb"], batch["proprio"], batch["instruction"]).shape \
+        == (2, 16, 7)
+
+
+def test_ot_coupling_is_a_permutation_and_lowers_cost():
+    """minibatch OT 只能重排 x0，不能改动它的取值 —— 边缘分布必须原样保留，
+    否则 CFM 回归的就不是同一个速度场了。"""
+    from src.models.policy import ot_couple
+    torch.manual_seed(0)
+    x0 = torch.randn(32, 16, 7)
+    x1 = torch.randn(32, 16, 7)
+    out = ot_couple(x0, x1)
+    before = (x0 - x1).pow(2).sum()
+    after = (out - x1).pow(2).sum()
+    assert after <= before
+    # 排序后逐位相同 = 确实只是换了顺序
+    assert torch.allclose(out.flatten().sort().values, x0.flatten().sort().values)
+
+
+def test_logitnormal_time_concentrates_on_the_middle():
+    """均匀采样把一半预算花在 t≈0 / t≈1，那两端的速度场近乎平凡。"""
+    from src.models.policy import sample_flow_time
+    torch.manual_seed(0)
+    u = sample_flow_time(20000, "cpu", "uniform")
+    ln = sample_flow_time(20000, "cpu", "logitnormal")
+    mid = lambda t: ((t > 0.2) & (t < 0.8)).float().mean()
+    assert 0.0 < ln.min() and ln.max() < 1.0
+    assert mid(ln) > mid(u) + 0.15
+
+
+def test_goal_slot_keeps_one_observation_space():
+    """多任务的全部前提：有没有 goal_pos，proprio 维度都得一样。
+
+    有效位不可省 —— 少了它，"目标在原点"与"这个任务没有目标"在网络看来一模一样。
+    """
+    from src.data.dataset import build_proprio
+    q = np.random.randn(4, 9)
+    with_goal = build_proprio(q, np.random.randn(4, 3), goal_slot=True)
+    without = build_proprio(q, None, goal_slot=True)
+    assert with_goal.shape == without.shape == (4, 13)
+    assert torch.equal(with_goal[:, -1], torch.ones(4))
+    assert torch.equal(without[:, -1], torch.zeros(4))
+    assert torch.equal(without[:, 9:12], torch.zeros(4, 3))
+    # 旧的 use_goal 行为不能被改坏（已发布的 12 维 checkpoint 还要能读）
+    assert build_proprio(q, np.random.randn(4, 3)).shape == (4, 12)
+    assert build_proprio(q).shape == (4, 9)
+
+
+def test_visual_encoder_accepts_cached_tokens():
+    """缓存路径与像素路径必须走到同一个 proj 上，且只靠维数分派。"""
+    from src.models.encoders import VisualEncoder
+    enc = VisualEncoder(d_model=32, img_size=126).eval()
+    feats = torch.randn(2, 2, enc.n_patches, enc.embed_dim)
+    with torch.no_grad():
+        out = enc(feats)
+    assert out.shape == (2, enc.n_patches, 32)
+    with torch.no_grad():
+        expect = enc.proj(feats.mean(dim=1))
+    assert torch.allclose(out, expect)
