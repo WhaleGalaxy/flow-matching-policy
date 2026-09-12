@@ -19,8 +19,35 @@ def _np(x):
     return x.cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.data.dataset import (CONTROL_MODE, TASK_INSTRUCTIONS,  # noqa: E402
-                              build_proprio, preprocess_obs_rgb)
+from src.data.dataset import (CONTROL_MODE, TASK_GOAL_ACTOR,  # noqa: E402
+                              TASK_INSTRUCTIONS, build_proprio, preprocess_obs_rgb)
+
+
+def obs_kwargs(cfg) -> dict:
+    """从 checkpoint 的 cfg 里取出**全部**观测配置，一次性传给 rollout。
+
+    存在的理由：观测配置现在有四项（use_goal / goal_slot / task_goal / use_proprio），
+    每个评测脚本各自手工挑几项传，加一项就断一处 —— 本项目已经因此断过三次
+    （diagnose_rollout 两次、language_ablation 一次），症状都是
+    `mat1 and mat2 shapes cannot be multiplied (1x9 and 12x128)`。
+    只要新配置项加进这个函数，所有调用方自动跟上。
+    """
+    return dict(use_goal=cfg.get("use_goal", False),
+                goal_slot=cfg.get("goal_slot", False),
+                task_goal=cfg.get("task_goal", False))
+
+
+def task_goal_pos(env, task: str) -> np.ndarray:
+    """从**运行中的环境**读这个任务的目标位置。
+
+    训练侧读的是演示 h5 里的 `env_states/actors/<name>` 前 3 维，两者必须指向
+    同一个量，否则训练和评测的第 10-12 维含义不同 —— 而这种错位是静默的：
+    维度对得上，loss 正常，策略只是学不会送达。已逐位对拍验证一致。
+    """
+    actor = TASK_GOAL_ACTOR.get(task)
+    assert actor, f"{task} 没有登记目标 actor，见 src/data/dataset.TASK_GOAL_ACTOR"
+    p = getattr(env.unwrapped, actor).pose.p
+    return _np(p).reshape(-1)[:3]
 
 
 # 评测环境的控制模式**必须**与训练数据一致，且必须显式指定 ——
@@ -55,9 +82,19 @@ def rollout(
     seed: int = 0,
     record_frames: bool = False,
     use_goal: bool = False,
+    goal_slot: bool = False,
+    task_goal: bool = False,
+    n_average: int = 1,
+    instruction: str | None = None,
 ) -> dict:
+    """`instruction` 传入时覆盖该任务的默认指令。
+
+    这是"语言到底有没有被用上"那个消融的入口：把别的任务的指令、或者 CFG 用的
+    空串喂进去，成功率掉多少就是语言在这个策略里实际承载了多少信息。掉不动的话，
+    说明任务是从像素里读出来的，"语言条件"这四个字就不能写进结论。
+    """
     device = next(policy.parameters()).device
-    instruction = TASK_INSTRUCTIONS[task]
+    instruction = TASK_INSTRUCTIONS[task] if instruction is None else instruction
     policy.eval()
 
     successes, lengths, frames = [], [], []
@@ -79,8 +116,13 @@ def rollout(
         def push(o):
             rgb = o["sensor_data"][camera]["rgb"][0]        # (128,128,3) uint8
             # proprio 的组装必须与训练完全一致，走同一个 build_proprio
-            prop = build_proprio(_np(o["agent"]["qpos"][0]),
-                                 _np(o["extra"]["goal_pos"][0]) if use_goal else None)
+            if task_goal:
+                goal = task_goal_pos(env, task)
+            elif use_goal or (goal_slot and "goal_pos" in o["extra"]):
+                goal = _np(o["extra"]["goal_pos"][0])
+            else:
+                goal = None
+            prop = build_proprio(_np(o["agent"]["qpos"][0]), goal, goal_slot=goal_slot)
             while len(rgb_hist) < obs_horizon:
                 rgb_hist.append(rgb); prop_hist.append(prop)
             rgb_hist.append(rgb); prop_hist.append(prop)
@@ -95,7 +137,8 @@ def rollout(
                 [torch.as_tensor(p) for p in prop_hist]).unsqueeze(0).float().to(device)
 
             chunk = policy.predict_action(
-                rgb, proprio, [instruction], n_steps=n_steps, guidance=guidance)[0]
+                rgb, proprio, [instruction], n_steps=n_steps, guidance=guidance,
+                n_average=n_average)[0]
 
             for k in range(min(execute_horizon, chunk.shape[0])):
                 obs, _, terminated, truncated, info = env.step(chunk[k].cpu().numpy())

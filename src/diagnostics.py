@@ -59,8 +59,87 @@ def check_dataset(dataset, verbose: bool = True) -> dict:
 
     sample = dataset[0]
     rgb = sample["rgb"]
+    if getattr(dataset, "feature_cache", None) is not None:
+        # 走缓存时 "rgb" 是 (T, n_patches, 384) 的冻结特征，不是像素，
+        # 拿 ImageNet 的均值方差去判它没有意义。改为检查缓存本身是不是活的：
+        # 全零或含 NaN 说明缓存建坏了，而那种错误在 loss 上要好几千步才看得出来。
+        assert rgb.ndim == 3, f"缓存特征应为 (T,N,D)，得到 {tuple(rgb.shape)}"
+        assert torch.isfinite(rgb).all(), "缓存特征里有 NaN/Inf"
+        assert rgb.abs().max() > 0, "缓存特征全零，缓存八成建坏了"
+        if verbose:
+            print(f"  冻结特征缓存: {tuple(rgb.shape)}  "
+                  f"mean {rgb.mean():+.3f} std {rgb.std():.3f}", flush=True)
+        return snr
     assert rgb.ndim == 4, f"rgb 应为 (T,3,H,W)，得到 {tuple(rgb.shape)}"
     if verbose:
         print(f"  图像归一化后: mean {rgb.mean():+.3f} std {rgb.std():.3f} "
               f"(ImageNet 归一化后应在 mean≈0±0.5, std≈1±0.4 范围)", flush=True)
     return snr
+
+
+def _ridge_fit_predict(Xtr, Ytr, Xte, alpha):
+    """岭回归。D > N 时走对偶形式，解 N×N 而不是 D×D 的方程。
+
+    patch token 展平后有 81×384 ≈ 31k 维，远多于样本数，primal 形式在这个规模上
+    既慢又病态。两条路数学上等价。
+    """
+    y_mu = Ytr.mean(0)
+    Yc = Ytr - y_mu
+    if Xtr.shape[1] > len(Xtr):
+        K = Xtr @ Xtr.T
+        A = np.linalg.solve(K + alpha * np.eye(len(K)), Yc)
+        return (Xte @ Xtr.T) @ A + y_mu
+    D = Xtr.shape[1]
+    W = np.linalg.solve(Xtr.T @ Xtr + alpha * np.eye(D), Xtr.T @ Yc)
+    return Xte @ W + y_mu
+
+
+def linear_probe(features: np.ndarray, targets: np.ndarray, train_frac: float = 0.7,
+                 alphas=(1e-1, 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6), seed: int = 0) -> dict:
+    """岭回归探针：冻结特征里到底还有没有这个量。
+
+    三个设计点，缺一个结论就不成立：
+
+    1. **在留出集上报 R²，不是训练集。** patch token 有 31k 维，训练集上拟合
+       任意 300 个样本都能得到 R²≈1，看不出任何东西。
+    2. **基准用训练集均值**，所以 R² 可以为负。用留出集自己的均值做基准是作弊的，
+       那样 R² 永远非负，也就永远看不出"特征里根本没有这个量"。
+    3. **正则强度在内层验证集上选**，不在报告用的留出集上选。这是给"信息存在"
+       这一侧最好的机会 —— 否则一个欠正则的探针会把任何东西都测成不可观测，
+       负结论就没有意义了。
+
+    features (N, D)   targets (N, k)
+    返回 {"r2": 逐轴 R², "rmse": 逐轴 RMSE, "target_std": 目标自身标准差, "alpha": 选中的正则}
+    """
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(features))
+    n_tr = int(len(features) * train_frac)
+    tr, te = perm[:n_tr], perm[n_tr:]
+
+    X, Y = np.asarray(features, np.float64), np.asarray(targets, np.float64)
+    if Y.ndim == 1:
+        Y = Y[:, None]
+
+    mu, sd = X[tr].mean(0), X[tr].std(0) + 1e-8
+    Xtr, Xte = (X[tr] - mu) / sd, (X[te] - mu) / sd
+
+    # 内层再切一刀选 alpha，报告用的留出集全程不参与
+    n_fit = int(len(tr) * 0.75)
+    fit, val = slice(0, n_fit), slice(n_fit, len(tr))
+    best, best_alpha = -np.inf, alphas[0]
+    for a in alphas:
+        pred = _ridge_fit_predict(Xtr[fit], Y[tr][fit], Xtr[val], a)
+        base = Y[tr][val] - Y[tr][fit].mean(0)
+        r2 = 1.0 - ((pred - Y[tr][val]) ** 2).sum(0) / np.maximum((base ** 2).sum(0), 1e-12)
+        if r2.mean() > best:
+            best, best_alpha = r2.mean(), a
+
+    pred = _ridge_fit_predict(Xtr, Y[tr], Xte, best_alpha)
+    err = pred - Y[te]
+    base = Y[te] - Y[tr].mean(0)
+    return {
+        "r2": 1.0 - (err ** 2).sum(0) / np.maximum((base ** 2).sum(0), 1e-12),
+        "rmse": np.sqrt((err ** 2).mean(0)),
+        "target_std": Y.std(0),
+        "alpha": best_alpha, "n_train": len(tr), "n_test": len(te),
+    }

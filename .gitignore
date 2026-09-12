@@ -4,15 +4,24 @@ __pycache__/
 *.egg-info/
 
 # data / checkpoints / logs
-data/
-demos/
+# 前导斜杠不能省：写成 `data/` 会匹配**任意层级**下叫 data 的目录，
+# 包括 src/data/ —— 那会让 src/data/dataset.py 从未进过仓库，
+# 而 src/train.py 直接 import 它，clone 下来第一步就 ImportError。
+/data/
+/demos/
 *.h5
 *.ckpt
 *.pt
 *.npy
 wandb/
-outputs/
+outputs/**
+!outputs/
+!outputs/*/
 multirun/
+# 结果表要进版本库：README 与 docs/status.md 里的每个数字都声称可以复核，
+# 而 CSV 一共十几 KB。checkpoint、日志、图像仍然排除在外。
+# 注意目录本身必须先取消忽略，否则 git 不会下降进去看里面的文件。
+!outputs/**/*.csv
 
 # media
 *.gif

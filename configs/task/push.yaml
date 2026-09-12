@@ -1,0 +1,5 @@
+name: PushCube-v1
+instruction: "Push the cube to the goal region"
+act_dim: 7
+proprio_dim: 9
+demo_path: ~/.maniskill/demos/PushCube-v1/trajectory.h5

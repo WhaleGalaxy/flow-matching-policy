@@ -5,6 +5,13 @@ defaults:
 # 任务：单任务给一个，多任务给多个（自动启用等比例采样）
 tasks: [PickCube-v1]
 
+# 演示来源。给多个就是把同一个任务的不同解法混在一起 —— ManiSkill 对 PickCube
+# 同时提供 motionplanning 和 rl 两套演示，后者是 PPO 学出来的另一套策略。
+# 单一来源的条件动作分布实测是**宽的单峰**（双峰系数 0.49，正态是 0.555），
+# 生成式动作头没有多模态可表示，等条件的回归基线反而更强；混合来源才造得出
+# 真正的多模态。见 scripts/conditional_spread.py 与 docs/debugging.md 第六轮。
+sources: [motionplanning]
+
 seed: 42
 device: cuda
 
@@ -33,16 +40,53 @@ use_proprio: true
 # StackCube / PegInsertion 的 obs 里没有 goal_pos，开启会 assert。
 use_goal: false
 
+# 多任务用这个，不要用 use_goal。恒定输出 13 维 = qpos(9) + goal(3) + valid(1)，
+# 没有 goal_pos 的任务填零并把 valid 置 0，于是所有任务共用一个观测空间。
+# use_goal 那种"有就 12 维、没有就 9 维"的做法让 proprio_dim 在任务间跳动，
+# 这正是 README 里"多任务与显式目标不可兼得"那条限制的全部内容。
+goal_slot: false
+
+# 多任务真正该用的是这个：每个任务从自己的 actor 取目标位置（PickCube 是不可见的
+# 目标标记，PushCube 是桌面目标区域，StackCube 是下面那块方块），proprio 恒为 12 维，
+# 与单任务 use_goal 的观测空间完全一致。goal_slot 那种"没有目标就填零 + 有效位"的
+# 做法实测无效：三个任务里两个的目标槽恒为零，编码器学会不看它，
+# 多任务 PickCube 退回"抓取率 90% / 成功率 6%"。见 docs/debugging.md 第五轮。
+task_goal: false
+
+# 冻结视觉骨干占约 88% 的训练时间，而管线里没有任何图像增强，
+# 所以把 DINOv2 的 patch token 预先算好存盘是**数值等价**的。
+# 见 scripts/build_feature_cache.py；null = 不用缓存，走原来的像素路径。
+feature_cache: null
+
+# 每多少步存一次 last.pt（含优化器状态）。掉电最多损失这么多步。
+ckpt_every: 1000
+resume: true
+
+# 把非视觉 token（语言 + 本体/目标）额外作为全局条件经 AdaLN 注入每一层。
+# 关掉时任务身份只存在于 83 个 context token 里的 2 个，注意力可以直接忽略 ——
+# 实测三任务联合训练 PickCube 3% / PushCube 82% / StackCube 4%，
+# 也就是学会最容易的那个任务然后到处执行它。默认 false 保证既有结果可复现。
+global_cond: false
+
 # ---- 评测 ----
 eval:
   every: 5000
   n_episodes: 25         # 训练中途用少量 episode 看趋势，最终评测用 100
+  # 训练中途评测用哪套权重。默认在线而非通行的 EMA：ema_decay=0.9999 的时间常数
+  # 是 10000 步，对 20000 步的训练太慢，EMA 读数会平成一条与训练进度无关的直线
+  # （实测在线 6/37/59/70/75% vs EMA 8/4/4/4/4%）。训练更久时可以改回 true。
+  use_ema: false
   execute_horizon: 8
   guidance: 1.0
 
 # ---- 日志 / 产物 ----
 wandb:
-  enabled: false
+  enabled: true
   project: fm-policy
+  # null = 用 `wandb login` 时的默认 entity。本机默认 entity 是团队
+  # models-national-university-of-singapore，个人账号下看不到 run 时把这里写成用户名。
+  entity: null
+  # 额外打的标签，便于在网页上筛选（模型名与任务会自动加上）
+  tags: []
 out_dir: outputs
 run_name: null           # null = 自动根据 model/tasks/seed 生成

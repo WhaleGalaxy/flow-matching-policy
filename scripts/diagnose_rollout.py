@@ -18,9 +18,14 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "scripts"))
-from src.evaluate import make_env  # noqa: E402
-from src.data.dataset import TASK_INSTRUCTIONS, preprocess_obs_rgb  # noqa: E402
+from src.evaluate import make_env, obs_kwargs, task_goal_pos  # noqa: E402
+from src.data.dataset import (TASK_INSTRUCTIONS, build_proprio,  # noqa: E402
+                              preprocess_obs_rgb)
 from run_eval import load_policy  # noqa: E402
+
+
+def _np(x):
+    return x.cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
 
 
 def _p(x):
@@ -28,8 +33,18 @@ def _p(x):
 
 
 @torch.no_grad()
+def manip_obj(unwrapped):
+    """被操作的物体在不同任务里叫不同的名字。写死 `u.cube` 会在 StackCube 上
+    崩成 `'StackCubeEnv' object has no attribute 'cube'`。"""
+    for name in ("cube", "cubeA", "obj", "peg"):
+        if hasattr(unwrapped, name):
+            return getattr(unwrapped, name)
+    raise AttributeError(f"{type(unwrapped).__name__} 上找不到被操作物体")
+
+
 def diagnose(policy, env, task, n_episodes=10, obs_horizon=2, execute_horizon=8,
-             img_size=126, n_steps=10, guidance=1.0, max_steps=300, seed=0):
+             img_size=126, n_steps=10, guidance=1.0, max_steps=300, seed=0,
+             use_goal=False, goal_slot=False, task_goal=False):
     from collections import deque
     device = next(policy.parameters()).device
     instruction = TASK_INSTRUCTIONS[task]
@@ -41,15 +56,25 @@ def diagnose(policy, env, task, n_episodes=10, obs_horizon=2, execute_horizon=8,
         rgb_hist, prop_hist = deque(maxlen=obs_horizon), deque(maxlen=obs_horizon)
 
         def push(o):
-            rgb, qpos = o["sensor_data"]["base_camera"]["rgb"][0], o["agent"]["qpos"][0]
+            # proprio 的组装必须与训练完全一致，走 dataset 里同一个 build_proprio。
+            # 这里曾经直接用 qpos，遇到 use_goal 的 checkpoint 会撞出
+            # `mat1 and mat2 shapes cannot be multiplied (1x9 and 12x128)`。
+            rgb = o["sensor_data"]["base_camera"]["rgb"][0]
+            if task_goal:
+                goal = task_goal_pos(env, task)
+            elif use_goal or (goal_slot and "goal_pos" in o["extra"]):
+                goal = _np(o["extra"]["goal_pos"][0])
+            else:
+                goal = None
+            prop = build_proprio(_np(o["agent"]["qpos"][0]), goal, goal_slot=goal_slot)
             while len(rgb_hist) < obs_horizon:
-                rgb_hist.append(rgb); prop_hist.append(qpos)
-            rgb_hist.append(rgb); prop_hist.append(qpos)
+                rgb_hist.append(rgb); prop_hist.append(prop)
+            rgb_hist.append(rgb); prop_hist.append(prop)
 
         push(obs)
         d_tcp, cube_z, grasped, success, t = [], [], False, False, 0
-        d_tcp.append(np.linalg.norm(_p(u.agent.tcp.pose.p) - _p(u.cube.pose.p)))
-        z0 = _p(u.cube.pose.p)[2]
+        d_tcp.append(np.linalg.norm(_p(u.agent.tcp.pose.p) - _p(manip_obj(u).pose.p)))
+        z0 = _p(manip_obj(u).pose.p)[2]
 
         while t < max_steps and not success:
             rgb = preprocess_obs_rgb(
@@ -62,9 +87,9 @@ def diagnose(policy, env, task, n_episodes=10, obs_horizon=2, execute_horizon=8,
             for k in range(min(execute_horizon, chunk.shape[0])):
                 obs, _, term, trunc, info = env.step(chunk[k].cpu().numpy())
                 push(obs); t += 1
-                d_tcp.append(np.linalg.norm(_p(u.agent.tcp.pose.p) - _p(u.cube.pose.p)))
-                cube_z.append(_p(u.cube.pose.p)[2])
-                grasped = grasped or bool(np.asarray(u.agent.is_grasping(u.cube).cpu()).reshape(-1)[0])
+                d_tcp.append(np.linalg.norm(_p(u.agent.tcp.pose.p) - _p(manip_obj(u).pose.p)))
+                cube_z.append(_p(manip_obj(u).pose.p)[2])
+                grasped = grasped or bool(np.asarray(u.agent.is_grasping(manip_obj(u)).cpu()).reshape(-1)[0])
                 success = bool(np.asarray(info["success"]).reshape(-1)[0]) if not torch.is_tensor(info["success"]) \
                     else bool(info["success"].cpu().reshape(-1)[0])
                 if success or bool(np.asarray(term.cpu() if torch.is_tensor(term) else term).reshape(-1)[0]) \
@@ -109,7 +134,8 @@ def main():
         rows = diagnose(policy, env, args.task, n_episodes=args.n_episodes,
                         obs_horizon=cfg["obs_horizon"], img_size=cfg["img_size"],
                         execute_horizon=cfg["eval"]["execute_horizon"],
-                        n_steps=args.n_steps, guidance=args.guidance)
+                        n_steps=args.n_steps, guidance=args.guidance,
+                        **obs_kwargs(cfg))
     finally:
         env.close()
     report(rows, f"{name} @ {args.ckpt.name}  {args.task}")
