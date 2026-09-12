@@ -1,0 +1,6 @@
+# 与 FM 逐层相同的骨干，只是没有噪声输入、没有流时间、没有采样循环。
+# 存在的理由：把"建模方式"与"读出方式"这两件事拆开，见 BCXAttnPolicy 的文档。
+name: bc_xattn
+d_model: 256
+n_layers: 4
+n_heads: 8

@@ -54,6 +54,15 @@ class VisualEncoder(nn.Module):
         return self
 
     def forward(self, imgs: torch.Tensor) -> torch.Tensor:
+        # 训练时可以喂预先算好的 patch token 而不是像素（见
+        # scripts/build_feature_cache.py）。骨干冻结、管线里没有图像增强，
+        # 所以这两条路径**数值等价**，只是省掉了约 88% 的训练时间。
+        # 靠维数分派：像素是 (B,T,3,H,W) 五维，缓存特征是 (B,T,N,384) 四维。
+        if imgs.ndim == 4:
+            assert imgs.shape[-1] == self.embed_dim, (
+                f"缓存特征的最后一维应为 {self.embed_dim}, got {imgs.shape[-1]}")
+            return self.proj(imgs.mean(dim=1))
+
         B, T = imgs.shape[:2]
         flat = imgs.reshape(B * T, *imgs.shape[2:])
 

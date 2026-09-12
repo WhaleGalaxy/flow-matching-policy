@@ -133,10 +133,22 @@ class FMDenoiser(nn.Module):
         n_heads: int = 8,
         act_dim: int = 7,
         act_horizon: int = 16,
+        n_global_cond: int = 0,
     ):
         super().__init__()
         self.act_dim = act_dim
         self.act_horizon = act_horizon
+        # 把 context 末尾的 n_global_cond 个 token（语言 + 本体/目标）额外作为
+        # **全局条件**经 AdaLN 注入，而不只是躺在 cross-attention 的 context 里。
+        #
+        # 为什么需要：多任务下任务身份全在这两个 token 上，而它们是 83 个 token
+        # 里的 2 个 —— 注意力可以直接不看它们，实测三任务联合训练的结果是
+        # PickCube 3% / PushCube 82% / StackCube 4%，也就是策略学会了最容易的
+        # 那个任务然后到处执行它。AdaLN 调制每一层的 scale/shift，绕不过去。
+        # 这是 DiT 注入类别标签的做法，条件化的位置比条件化的内容更重要。
+        #
+        # 0 = 关闭，与既有 checkpoint 逐位兼容。
+        self.n_global_cond = n_global_cond
 
         self.t_emb = SinusoidalPosEmb(d_model)
         self.t_mlp = nn.Sequential(
@@ -149,6 +161,14 @@ class FMDenoiser(nn.Module):
         self.blocks = nn.ModuleList(
             [DenoiserBlock(d_model, d_context, n_heads) for _ in range(n_layers)]
         )
+        if n_global_cond:
+            self.cond_mlp = nn.Sequential(
+                nn.Linear(d_context, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
+            # 末层归零：训练起步时全局条件的贡献为 0，等价于关闭这条通路，
+            # 于是它只能靠梯度**挣**到影响力，不会一上来就扰乱已经稳定的初始化。
+            nn.init.zeros_(self.cond_mlp[-1].weight)
+            nn.init.zeros_(self.cond_mlp[-1].bias)
+
         self.norm_out = AdaLN(d_model, d_model)
         self.action_out = nn.Linear(d_model, act_dim)
         # 输出层归零：训练第一步预测速度为 0，避免初期发散
@@ -159,6 +179,10 @@ class FMDenoiser(nn.Module):
         assert noisy_action.shape[1] == self.act_horizon, (
             f"动作块长度应为 {self.act_horizon}, got {noisy_action.shape[1]}")
         t_emb = self.t_mlp(self.t_emb(t))          # (B, d_model)
+        if self.n_global_cond:
+            # 从 context 自己末尾取，CFG 时 context 已经是 (2B, ...)，
+            # 有条件/无条件两路各自拿到自己的语言 token，不需要额外传参
+            t_emb = t_emb + self.cond_mlp(context[:, -self.n_global_cond:, :].mean(1))
         x = self.action_in(noisy_action) + self.pos_emb
         for block in self.blocks:
             x = block(x, t_emb, context)
