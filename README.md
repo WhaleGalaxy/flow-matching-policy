@@ -349,16 +349,12 @@ PickCube 的链条是 接近 → 抓取 → 送达 → 静止。环境自己就�
 
 ## 架构
 
-```
-RGB (2帧, 126×126)  ──► DINOv2-S (冻结) ──► 81 个 patch token ─┐
-语言指令             ──► SigLIP 文本塔(冻结) ──► 1 个 token ────┼─► context (B, 83, 256)
-本体状态 (12 维:关节角+目标) ──► MLP ──────► 1 个 token ────┘         │
-                                                                      │ cross-attn
-噪声动作块 x_t (16×7) ──► Transformer denoiser (AdaLN 注入流时间 t) ◄──┘
-                                    │
-                                    ▼
-                         速度场 v_θ ──► Euler 积分 ──► 动作块
-```
+![architecture](docs/figures/architecture.png)
+
+*上半是三条臂完全共用的条件通路，下半是唯一被替换的部件。**灰框 = 三条臂逐层相同，
+彩框 = 这条臂独有** —— 受控对比的全部内容就在这个配色里，而最右边 BC 那列没有回环，
+这就是延迟差距（14.3 ms 对 133.6 ms）的来源。
+复现：`python scripts/draw_architecture.py`*
 
 - 视觉/语言骨干全部冻结（**99.5% 参数冻结**）：演示只有 1000 条/任务，微调 ViT 必然过拟合
 - denoiser 用 DiT 式设计：AdaLN 注入流时间，残差分支与输出层**零初始化**，起步即恒等映射
@@ -547,7 +543,7 @@ fm_policy/
 │   │   ├── build_feature_cache.py   # 冻结 patch token 预计算（数值等价）
 │   │   ├── queue.sh + queue_plan_main.sh  # 串行队列，阶段级 .done 断点续跑
 │   │   └── wait_then_run.sh         # 队列串联（pidfile 判据，不用 pgrep）
-│   └── pareto.py / make_report.py / benchmark_inference.py
+│   └── pareto.py / make_report.py / benchmark_inference.py / draw_architecture.py
 ├── notebooks/        # 逐步验证实验（玩具 FM、编码器选型、多模态论证）
 ├── docs/             # 推导 / 排查记录 / 进度 / GPU 配置
 └── tests/            # pytest 31 个
