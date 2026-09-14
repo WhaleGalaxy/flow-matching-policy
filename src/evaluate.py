@@ -37,6 +37,24 @@ def obs_kwargs(cfg) -> dict:
                 task_goal=cfg.get("task_goal", False))
 
 
+def obs_proprio(env, obs, task: str, use_goal: bool = False,
+                goal_slot: bool = False, task_goal: bool = False):
+    """从运行中的环境观测组装 proprio。**所有评测入口都必须走这一个函数。**
+
+    2026-09-13 的教训：scripts/failure_modes.py 自己抄了一份，只认识 use_goal、
+    不认识 task_goal，于是拿 task_goal 训出来的 checkpoint 去跑失败归因，
+    proprio 出来 9 维而模型要 12 维，直接 RuntimeError。这次是维度对不上所以
+    崩了；如果哪天两个分支维度恰好相同，它就会变成静默的错位。
+    """
+    if task_goal:
+        goal = task_goal_pos(env, task)
+    elif use_goal or (goal_slot and "goal_pos" in obs["extra"]):
+        goal = _np(obs["extra"]["goal_pos"][0])
+    else:
+        goal = None
+    return build_proprio(_np(obs["agent"]["qpos"][0]), goal, goal_slot=goal_slot)
+
+
 def task_goal_pos(env, task: str) -> np.ndarray:
     """从**运行中的环境**读这个任务的目标位置。
 
@@ -115,14 +133,8 @@ def rollout(
 
         def push(o):
             rgb = o["sensor_data"][camera]["rgb"][0]        # (128,128,3) uint8
-            # proprio 的组装必须与训练完全一致，走同一个 build_proprio
-            if task_goal:
-                goal = task_goal_pos(env, task)
-            elif use_goal or (goal_slot and "goal_pos" in o["extra"]):
-                goal = _np(o["extra"]["goal_pos"][0])
-            else:
-                goal = None
-            prop = build_proprio(_np(o["agent"]["qpos"][0]), goal, goal_slot=goal_slot)
+            # proprio 的组装必须与训练完全一致，走同一个 obs_proprio
+            prop = obs_proprio(env, o, task, use_goal, goal_slot, task_goal)
             while len(rgb_hist) < obs_horizon:
                 rgb_hist.append(rgb); prop_hist.append(prop)
             rgb_hist.append(rgb); prop_hist.append(prop)

@@ -21,9 +21,8 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "scripts"))
-from src.data.dataset import (TASK_INSTRUCTIONS, build_proprio,  # noqa: E402
-                              preprocess_obs_rgb)
-from src.evaluate import make_env  # noqa: E402
+from src.data.dataset import TASK_INSTRUCTIONS, preprocess_obs_rgb  # noqa: E402
+from src.evaluate import make_env, obs_proprio  # noqa: E402
 from run_eval import load_policy  # noqa: E402
 
 # 接近的判据用夹爪能张开的尺度，不是任务参数：方块边长 20mm
@@ -72,7 +71,10 @@ def run(policy, env, task, cfg, n_episodes=100, n_steps=10, guidance=1.0,
     instruction = TASK_INSTRUCTIONS[task]
     obs_horizon = cfg["obs_horizon"]
     img_size = cfg["img_size"]
-    use_goal = cfg.get("use_goal", False)
+    # 观测配置一律从 checkpoint 里读，与 run_eval.py 同一个出口。
+    okw = dict(use_goal=cfg.get("use_goal", False),
+               goal_slot=cfg.get("goal_slot", False),
+               task_goal=cfg.get("task_goal", False))
     H = execute_horizon or cfg["eval"]["execute_horizon"]
     u = env.unwrapped
     policy.eval()
@@ -86,9 +88,9 @@ def run(policy, env, task, cfg, n_episodes=100, n_steps=10, guidance=1.0,
 
         def push(o):
             rgb = o["sensor_data"]["base_camera"]["rgb"][0]
-            # proprio 必须与训练走同一个 build_proprio，见 src/data/dataset.py
-            prop = build_proprio(_arr(o["agent"]["qpos"][0]),
-                                 _arr(o["extra"]["goal_pos"][0]) if use_goal else None)
+            # 走评测侧唯一的那个入口，不要在这里重写一份 —— 这正是
+            # 2026-09-13 那次 RuntimeError 的根因，见 src.evaluate.obs_proprio
+            prop = obs_proprio(env, o, task, **okw)
             while len(rgb_hist) < obs_horizon:
                 rgb_hist.append(rgb); prop_hist.append(prop)
             rgb_hist.append(rgb); prop_hist.append(prop)
