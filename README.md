@@ -57,6 +57,10 @@ MSE 回归会塌到条件均值，而均值可能本身就非法"。**这个理�
 
 | Method | PickCube | PushCube | StackCube |
 |---|---|---|---|
+| BC · mean-pool | 3±0% | — | — |
+| BC · cross-attn | 53±19% | — | — |
+| Diffusion Policy | 13±9% | — | — |
+| **FM (Ours)** | 61±15% | — | — |
 | BC cross-attn, multi-task · d_model=256 | 47±28% | 92±2% | 41±8% |
 | BC cross-attn, multi-task · d_model=384 | 36±0% | 91±0% | 47±0% |
 | Diffusion Policy, multi-task · cfg_dropout=0.0 | 6±3% | 95±2% | 1±1% |
@@ -66,7 +70,7 @@ MSE 回归会塌到条件均值，而均值可能本身就非法"。**这个理�
 
 ![results_main](docs/figures/results_main.png)
 
-*成功率为 100 episode 的评测结果，多 seed 取 mean±std；推理权重：在线（非 EMA）。复现：`python scripts/make_report.py --weights online`*
+*成功率为 100 episode 的评测结果，多 seed 取 mean±std；推理权重：在线（非 EMA）。复现：`python scripts/make_report.py --weights online --csv outputs/2026-09-12-heldout/pick.csv outputs/2026-09-12-heldout/multitask.csv`*
 
 <!-- /RESULTS_TABLE -->
 

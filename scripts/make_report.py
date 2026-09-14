@@ -72,6 +72,12 @@ def label_of(m: str) -> str:
     return " · ".join([base, *rest])
 
 
+def base_of(m: str) -> str:
+    """方法名去掉变体后缀，只留主线标识。与 label_of 用同一套前缀规则。"""
+    head, *rest = m.split("/")
+    return f"{head}/{rest[0]}" if rest and f"{head}/{rest[0]}" in LABEL else head
+
+
 def variant_tags(df, cols) -> "pd.Series":
     """按 method 分组，把组内**确实变化了的**配置列拼成一个后缀。
 
@@ -257,22 +263,43 @@ def plot_all(df: pd.DataFrame, out_dir: Path):
 
     # --- 图1：主结果分组柱状图 ---
     a = agg(main_rows(df))
+    # 每条主线只画 seed 数最多的那个配置。变体臂（加宽、改 cfg_dropout）多数是
+    # n=1 的对照，画进主图会让 10 条图例压住柱子，而且 n=1 的 ±0% 误差棒
+    # 看起来比 3 seed 的 ±28% 更可信 —— 恰好把可信度讲反了。变体仍在表里。
+    a["base"] = a.method.map(base_of)
+    a = (a.sort_values("count", ascending=False)
+          .groupby(["base", "task"], as_index=False).first())
     tasks = [t for t in SHORT if t in set(a.task)]
     models = order_of(set(a.method))
     if tasks and models:
-        fig, ax = plt.subplots(figsize=(7, 4))
-        w = 0.8 / len(models)
-        for i, m in enumerate(models):
-            sub = a[a.method == m].set_index("task")
-            xs = [j + i * w - 0.4 + w / 2 for j in range(len(tasks))]
-            ys = [100 * sub.loc[t, "mean"] if t in sub.index else 0 for t in tasks]
-            es = [100 * sub.loc[t, "std"] if t in sub.index else 0 for t in tasks]
-            ax.bar(xs, ys, w * 0.9, yerr=es, capsize=3,
-                   label=label_of(m), color=COLOR.get(m, "#666"))
+        fig, ax = plt.subplots(figsize=(9, 4))
+        # 逐任务作图，组内只排该任务**确实跑过**的方法。
+        # 原来的写法对缺测的格子填 0，于是"这个方法在这个任务上没跑"和
+        # "跑了，成功率 0%"画出来一模一样 —— 单任务的三条臂只有 PickCube，
+        # 结果 PushCube/StackCube 两组各多出三根贴地的柱子，读图的人会当成
+        # 三个方法在这两个任务上全军覆没。0% 是一个实验结果，没做过不是。
+        labelled = set()
+        for j, t in enumerate(tasks):
+            present = [m for m in models if t in set(a.task[a.method == m])]
+            w = 0.8 / max(len(present), 1)
+            for i, m in enumerate(present):
+                r = a[(a.method == m) & (a.task == t)].iloc[0]
+                ax.bar(j + i * w - 0.4 + w / 2, 100 * r["mean"], w * 0.9,
+                       yerr=100 * r["std"], capsize=3,
+                       color=COLOR.get(r["base"], COLOR.get(m, "#666")),
+                       label=None if m in labelled else label_of(m))
+                labelled.add(m)
         ax.set_xticks(range(len(tasks))); ax.set_xticklabels([SHORT[t] for t in tasks])
         ax.set_ylabel("Success rate (%)"); ax.set_ylim(0, 100)
-        ax.legend(); ax.grid(axis="y", alpha=0.3); ax.set_axisbelow(True)
-        ax.set_title("ManiSkill3 success rate (100 episodes)")
+        # 图例放轴外：柱子最高的一组到 98%，任何贴在图内的图例都会压住它
+        ax.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.01, 0.5),
+                  frameon=False)
+        ax.grid(axis="y", alpha=0.3); ax.set_axisbelow(True)
+        # 评测预算进标题。同一张图配同一段表，口径不同却都不写，读者没有
+        # 任何办法发现 —— 本项目 300 步、官方 100 步，两套数字差得很远。
+        ms = sorted(set(main_rows(df).get("max_steps", pd.Series(dtype=str))))
+        budget = f", {ms[0]}-step budget" if len(ms) == 1 and ms[0] != "?" else ""
+        ax.set_title(f"ManiSkill3 success rate (100 episodes{budget})")
         plt.tight_layout(); p = out_dir / "results_main.png"
         plt.savefig(p, dpi=140); figs.append(p); plt.close()
 
@@ -319,7 +346,8 @@ README_BEGIN = "<!-- RESULTS_TABLE -->"
 README_END = "<!-- /RESULTS_TABLE -->"
 
 
-def write_readme(table: str, figs: list, readme: Path, weights: str) -> None:
+def write_readme(table: str, figs: list, readme: Path, weights: str,
+                 csvs: list) -> None:
     """把结果表写进 README 的标记区间，幂等：重复运行只替换区间内容。"""
     text = readme.read_text()
     assert README_BEGIN in text, f"README 里找不到 {README_BEGIN} 标记"
@@ -331,7 +359,8 @@ def write_readme(table: str, figs: list, readme: Path, weights: str) -> None:
     body.append("")
     body.append(f"*成功率为 100 episode 的评测结果，多 seed 取 mean±std；"
                 f"推理权重：{'EMA' if weights == 'ema' else '在线（非 EMA）'}。"
-                f"复现：`python scripts/make_report.py --weights {weights}`*")
+                f"复现：`python scripts/make_report.py --weights {weights} "
+                f"--csv {' '.join(str(c) for c in csvs)}`*")
     block = f"{README_BEGIN}\n\n" + "\n".join(body) + f"\n\n{README_END}"
 
     if README_END in text:
@@ -345,7 +374,11 @@ def write_readme(table: str, figs: list, readme: Path, weights: str) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", type=Path, default=Path("outputs/results.csv"))
+    # 多份 CSV：主线的单任务与多任务是分两次跑的（20000 步 / 60000 步、
+    # 一个任务 / 三个任务），但它们是同一个口径下的同一张主结果表，
+    # 图和表必须一起出，否则又会出现"图画的是一份数据、表写的是另一份"。
+    ap.add_argument("--csv", type=Path, nargs="+",
+                    default=[Path("outputs/results.csv")])
     ap.add_argument("--out-dir", type=Path, default=Path("docs/figures"))
     # 最终评测对每个 checkpoint 同时跑了 EMA 与在线权重。两者绝不能混在一起
     # 聚合——那等于把两个不同的推理配置平均掉。默认只报 EMA。
@@ -359,7 +392,7 @@ def main():
     ap.add_argument("--readme", type=Path, default=Path("README.md"))
     args = ap.parse_args()
 
-    df = pd.read_csv(args.csv)
+    df = pd.concat([pd.read_csv(c) for c in args.csv], ignore_index=True)
     df["success_rate"] = df.success_rate.astype(float)
     n_raw = len(df)
     df = drop_diverged(df)
@@ -388,7 +421,7 @@ def main():
     for f in figs:
         print(f"  {f}")
     if args.write_readme:
-        write_readme(main_table(df), figs, args.readme, args.weights)
+        write_readme(main_table(df), figs, args.readme, args.weights, args.csv)
         print(f"\n已写入 {args.readme}")
 
 
