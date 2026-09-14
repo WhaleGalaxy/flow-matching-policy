@@ -104,29 +104,48 @@ def envelope(points):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", type=Path, required=True)
-    ap.add_argument("--ckpt", nargs="+", required=True,
+    ap.add_argument("--csv", type=Path)
+    ap.add_argument("--ckpt", nargs="+", default=[],
                     help="model=path 形式，例如 fm=outputs/fmgoal.../ckpt_20000.pt")
     ap.add_argument("--task", default="PickCube-v1")
     ap.add_argument("--fig", type=Path, default=Path("docs/figures/pareto_control_rate.png"))
-    ap.add_argument("--out-csv", type=Path, default=Path("outputs/pareto_points.csv"))
+    ap.add_argument("--out-csv", type=Path)
+    # 只重绘：成功率换一份，延迟沿用已经测好的。
+    # 存在的理由是 2026-09-11 的扩散采样修复（cosine 调度让 ᾱ 末项到 2.4e-7，
+    # DDIM 恰好从那一项起步）。修之前这张图上 DDPM 整条线锁死在 2%，
+    # 修完之后是 2→33%，图却没跟着重画。而延迟只由 (方法, 采样步数) 决定，
+    # 与权重无关，所以没有任何必要为了换一组成功率再占一次 GPU。
+    ap.add_argument("--replot-from", type=Path,
+                    help="从这个 CSV 读成功率，延迟沿用 --latency-csv，不测延迟")
+    ap.add_argument("--latency-csv", type=Path,
+                    default=Path("outputs/pareto_points.csv"),
+                    help="已测好的延迟表，配合 --replot-from 使用")
     args = ap.parse_args()
 
-    ckpts = dict(kv.split("=", 1) for kv in args.ckpt)
-    success = read_success(args.csv, args.task)
-    assert success, f"{args.csv} 里没有 {args.task} 的在线权重结果"
+    src = args.replot_from or args.csv
+    assert src, "--csv 与 --replot-from 至少要给一个"
+    success = read_success(src, args.task)
+    assert success, f"{src} 里没有 {args.task} 的在线权重结果"
 
-    # 每个 (model, n_steps) 只需测一次延迟，与 execute_horizon 无关
-    need = sorted({(m, s) for (m, s, _) in success if m in ckpts})
     latency: dict[tuple[str, int], float] = {}
-    for model in sorted({m for m, _ in need}):
-        policy, _, _ = load_policy(Path(ckpts[model]), use_ema=False)
-        for m, s in need:
-            if m == model:
-                latency[(m, s)] = measure_latency(policy, s)
-                print(f"  延迟 {m:<5} {s:>3} 步 : {latency[(m, s)]:6.2f} ms", flush=True)
-        del policy
-        torch.cuda.empty_cache()
+    if args.replot_from:
+        with open(args.latency_csv, newline="") as fh:
+            for r in csv.DictReader(fh):
+                latency[(r["model"], int(r["n_steps"]))] = float(r["latency_ms"])
+        print(f"沿用 {args.latency_csv} 里已测好的延迟（{len(latency)} 个组合），不重测")
+    else:
+        ckpts = dict(kv.split("=", 1) for kv in args.ckpt)
+        assert ckpts, "要实测延迟就得给 --ckpt"
+        # 每个 (model, n_steps) 只需测一次延迟，与 execute_horizon 无关
+        need = sorted({(m, s) for (m, s, _) in success if m in ckpts})
+        for model in sorted({m for m, _ in need}):
+            policy, _, _ = load_policy(Path(ckpts[model]), use_ema=False)
+            for m, s in need:
+                if m == model:
+                    latency[(m, s)] = measure_latency(policy, s)
+                    print(f"  延迟 {m:<5} {s:>3} 步 : {latency[(m, s)]:6.2f} ms", flush=True)
+            del policy
+            torch.cuda.empty_cache()
 
     rows, by_model = [], defaultdict(list)
     for (model, steps, H), sr in sorted(success.items()):
@@ -138,10 +157,13 @@ def main():
                          max_control_hz=round(f_max, 1), success_rate=sr))
         by_model[model].append((f_max, sr, (steps, H)))
 
-    args.out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.out_csv, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
-        w.writeheader(); w.writerows(rows)
+    out_csv = args.out_csv or (None if args.replot_from
+                               else Path("outputs/pareto_points.csv"))
+    if out_csv:
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_csv, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+            w.writeheader(); w.writerows(rows)
 
     print(f"\n{'模型':<6}{'采样步':>7}{'执行长度':>9}{'延迟ms':>9}{'可达Hz':>9}{'成功率':>9}")
     print("-" * 50)
@@ -150,11 +172,11 @@ def main():
               f"{r['latency_ms']:>9.2f}{r['max_control_hz']:>9.0f}"
               f"{100*r['success_rate']:>8.0f}%")
 
-    plot(by_model, args.fig, args.task)
-    print(f"\n已写出 {args.out_csv} 与 {args.fig}")
+    plot(by_model, args.fig, args.task, src)
+    print(f"\n已写出 {args.fig}" + (f" 与 {out_csv}" if out_csv else ""))
 
 
-def plot(by_model, path: Path, task: str):
+def plot(by_model, path: Path, task: str, src: Path | None = None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -169,19 +191,30 @@ def plot(by_model, path: Path, task: str):
         ax.plot([p[0] for p in env], [100 * p[1] for p in env], drawstyle="steps-post",
                 color=st["color"], lw=2.2, marker=st["marker"], ms=6, label=st["label"])
         # 只标包络上的点，标全部会糊成一片。BC 是一次前向，没有采样步数可言。
-        for fx, sy, (steps, H) in env:
-            tag = f"H={H}" if model == "bc" else f"{steps} steps / H={H}"
+        # 相邻两点的频率常常差不到一倍，标签同侧排必然叠在一起，所以交替上下。
+        for k, (fx, sy, (steps, H)) in enumerate(env):
+            tag = (f"H={H}" if model == "bc"
+                   else f"{steps} step{'s' if steps > 1 else ''} / H={H}")
             ax.annotate(tag, (fx, 100 * sy), textcoords="offset points",
-                        xytext=(4, 5), fontsize=7.5, color=st["color"])
+                        xytext=(5, 6 if k % 2 == 0 else -13),
+                        fontsize=7.5, color=st["color"])
 
     ax.set_xscale("log")
+    # 右端标签是向右伸的，留出余量，否则最快的那个配置的注释会被裁掉
+    ax.set_xlim(right=ax.get_xlim()[1] * 1.6)
     ax.set_xlabel("Sustainable closed-loop control rate   "
                   r"$f_{max}$ = execute_horizon / inference latency   (Hz, log)")
     ax.set_ylabel("Success rate (%)")
     ax.set_title(f"Deployment frontier: success rate reachable at a given "
-                 f"control rate ({task})")
+                 f"control rate ({task})", pad=18)
+    if src:
+        ax.text(0.5, 1.012, f"success rates from {src} · latency measured "
+                f"on this machine, batch=1", transform=ax.transAxes,
+                ha="center", fontsize=7.5, color="#666")
     ax.grid(alpha=0.25, which="both", lw=0.6)
-    ax.legend(frameon=False, loc="lower left")
+    # 图例放左上：两条包络一条在右上、一条在左下，左上是唯一不压数据的角。
+    # 原来的 "lower left" 正好盖住扩散那条线和它最左端的标签。
+    ax.legend(frameon=False, loc="upper left")
     ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
