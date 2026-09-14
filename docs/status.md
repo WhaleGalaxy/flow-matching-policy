@@ -218,9 +218,13 @@ StackCube / PegInsertion 的低分是真实结果，不是环境配置问题。
 
 - 受控对比训练完成后：跑 `scratchpad/sweeps.sh` 的消融，出主图与结果表
 - 基线各只有一个 seed。成功率的测量噪声实测约 3 个百分点
-- 旧的 `pd_joint_pos` 数据（约 7.7GB）与归档 checkpoint 可删：
-  `outputs/archive_v1_pd_joint_pos/`、
-  `~/.maniskill/demos/*/motionplanning/trajectory.rgb.pd_joint_pos.physx_cpu.h5`
+- 2026-09-14 清了 18.4GB：v1 的归档 checkpoint（6.2GB，`pd_joint_pos` 那一轮）、
+  旧演示数据 `~/.maniskill/demos/*/*.pd_joint_pos.physx_cpu.h5`（7.6GB），以及 42 个
+  `last.pt`（4.6GB）—— 后者除权重外只多出优化器状态，而这些 run 都已跑完，
+  `src/train.py` 对 `step >= cfg.steps` 的目录本来就直接返回。
+  评测与复现只读 `ckpt_*.pt`（model + ema + cfg），全部保留。
+  v1 的结论仍可复核：数字在 `outputs/archive_v1_pd_joint_pos/results_v1.csv`，
+  诊断过程在 `docs/debugging.md`，数据可用 `scripts/replay_demos.sh` 重放。
 - WandB 未接入（`++wandb.enabled=true` 需先 `wandb login`）
 - 冻结的视觉编码器占约 88% 的训练时间。要跑很多轮消融可以预先缓存特征，
   代价是失去像素级数据增强
