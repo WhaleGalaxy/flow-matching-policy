@@ -65,6 +65,45 @@ def load_policy(ckpt_path: Path, use_ema: bool = True, device: str = "cuda"):
     return policy.to(device).eval(), cfg, name
 
 
+# 每次给结果表加一列，旧文件就少一列。直接追加会让两种 schema 混在一个文件里，
+# 而 pandas 读出来的错位**不会报错**，只会安静地把数字对到错误的列上。
+# 表里的每一列都是"某次把不同实验平均成一个假数字"之后加上去的，见 docs/debugging.md，
+# 所以这里宁可原地迁移，也不允许两种表头共存。
+MIGRATIONS = (
+    ("goal_slot", "False"),   # 加列前的评测都不是 goal_slot 观测
+    ("n_average", "1"),       # 加列前都是抽单个样本
+    ("val_frac", "0.0"),      # 加列前没有留出集，全部 episode 进训练
+    ("max_steps", "300"),     # 加列前评测一律 300 步上限
+)
+
+
+def migrate_csv_header(path, header, migrations=MIGRATIONS):
+    """把旧表头就地补齐到 `header`，补不齐就直接报错。
+
+    只处理"恰好少一列"的情况：少两列以上说明文件来自更早的年代，
+    与其猜测每一列该填什么，不如让调用方换一个新文件。
+    """
+    with open(path, newline="") as fh:
+        rows = list(csv.reader(fh))
+    existing = rows[0] if rows else []
+    for missing, default in migrations:
+        if existing != [c for c in header if c != missing]:
+            continue
+        print(f"  {path} 缺 {missing} 列，就地补上（旧行一律 {default}）", flush=True)
+        Path(path).with_suffix(".csv.bak").write_bytes(Path(path).read_bytes())
+        j = header.index(missing)
+        with open(path, "w", newline="") as fh2:
+            w = csv.writer(fh2)
+            w.writerow(header)
+            for r in rows[1:]:
+                w.writerow(r[:j] + [default] + r[j:])
+        existing = header
+        break
+    assert existing == header, (
+        f"{path} 的表头是旧格式 {existing}，与当前不符。\n"
+        f"用 --out 指定一个新文件，不要混写。")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=Path, required=True)
@@ -76,6 +115,10 @@ def main():
                     help="execute_horizon：一次预测执行几步再重规划")
     ap.add_argument("--n-average", type=int, default=1,
                     help="独立采样 n 次取平均（用蒙特卡洛估计条件均值而不是抽一个样本）")
+    ap.add_argument("--max-steps", type=int, default=300,
+                    help="每个 episode 的环境步数上限。ManiSkill 给 PickCube-v1 "
+                         "注册的是 50，官方基线用的是 100，本项目一直用 300。"
+                         "这个值改成绩，所以它进结果表的 schema。")
     ap.add_argument("--no-ema", action="store_true")
     ap.add_argument("--out", type=Path, default=Path("outputs/results.csv"))
     args = ap.parse_args()
@@ -106,46 +149,29 @@ def main():
     # 配置**：K 个样本取平均估计条件均值，与抽一个样本是两回事（实测 PickCube
     # K=1/4/16 → 60/56/53%）。不记这一列，汇总脚本会把三者按 (ckpt,任务,步数)
     # 平均成 56%，一个不对应任何实验的数字。这与 use_goal 那一课是同一个形状。
-    header = ["ckpt", "model", "seed", "task", "use_goal", "goal_slot", "n_steps",
-              "guidance", "execute_horizon", "n_average", "ema", "n_episodes",
-              "success_rate", "mean_length"]
+    # 训练配置也必须进 schema，理由与 use_goal 完全相同，而且这一条已经在出错：
+    # outputs/2026-09-11/multitask.csv 里有 11 个 run，它们在 task_goal、训练步数、
+    # 模型宽度、cfg_dropout、OT 耦合上各不相同，但这些全都不在表里。于是 model="fm"
+    # 的八个 run 被 make_report 当成同一个方法的八个 seed 平均成 "4±2%"，
+    # 而 README 里那一行是 60/96/36。多 seed 实验会让这件事变得更糟：
+    # 真正的 seed 重复与不同配置的 run 在表里长得一模一样。
+    #   task_goal    每任务取目标 actor，与 use_goal/goal_slot 是三种不同的观测配置
+    #   steps        训练预算。20000 与 60000 步的多任务不是同一个实验
+    #   d_model      容量。6.80M 与 15.01M 的结论相反（60/96/36 对 4/95/8）
+    #   cfg_dropout  训练时指令置空的比例。0.2 与 0 实测 63/90/7 对 60/96/36
+    #   ot_coupling  batch 内最优指派。多任务上是负结果（2/96/0）
+    #   global_cond  非视觉 token 经 AdaLN 再注入一次
+    #   sources      演示来源。混合来源是另一份数据，不是另一个 seed
+    #   val_frac     留出比例。少 10% 训练数据是不同的实验
+    header = ["ckpt", "model", "seed", "task", "use_goal", "goal_slot", "task_goal",
+              "val_frac", "steps", "d_model", "cfg_dropout", "ot_coupling",
+              "global_cond", "sources", "n_steps", "guidance", "execute_horizon",
+              "max_steps", "n_average", "ema", "n_episodes", "success_rate",
+              "mean_length"]
     args.out.parent.mkdir(parents=True, exist_ok=True)
     new_file = not args.out.exists()
     if not new_file:
-        # 早期的 CSV 没有 execute_horizon 列。直接追加会让两种 schema 混在一个文件里，
-        # 而 pandas 读出来的错位不会报错，只会安静地把数字对到错误的列上。
-        with open(args.out, newline="") as fh:
-            rows = list(csv.reader(fh))
-        existing = rows[0] if rows else []
-        for missing in ("goal_slot", "n_average"):
-            if existing != [c for c in header if c != missing]:
-                continue
-            default = "False" if missing == "goal_slot" else "1"
-            print(f"  {args.out} 缺 {missing} 列，就地补上（旧行一律 {default}）",
-                  flush=True)
-            args.out.with_suffix(".csv.bak").write_bytes(args.out.read_bytes())
-            jj = header.index(missing)
-            with open(args.out, "w", newline="") as fh2:
-                w2 = csv.writer(fh2); w2.writerow(header)
-                for r in rows[1:]:
-                    w2.writerow(r[:jj] + [default] + r[jj:])
-            existing = header
-            break
-        if False:
-            # 旧文件没有 goal_slot 列。就地补上（旧结果全部是 goal_slot=False），
-            # 而不是让两种 schema 混在一个文件里 —— pandas 读错位不会报错。
-            print(f"  {args.out} 是旧表头，补上 goal_slot 列（旧行一律 False）", flush=True)
-            args.out.with_suffix(".csv.bak").write_bytes(args.out.read_bytes())
-            j = header.index("goal_slot")
-            with open(args.out, "w", newline="") as fh:
-                w0 = csv.writer(fh)
-                w0.writerow(header)
-                for r in rows[1:]:
-                    w0.writerow(r[:j] + ["False"] + r[j:])
-            existing = header
-        assert existing == header, (
-            f"{args.out} 的表头是旧格式 {existing}，与当前不符。\n"
-            f"用 --out 指定一个新文件，不要混写。")
+        migrate_csv_header(args.out, header)
     with open(args.out, "a", newline="") as fh:
         w = csv.writer(fh)
         if new_file:
@@ -161,14 +187,27 @@ def main():
                             r = rollout(policy, env, task, n_episodes=args.n_episodes,
                                         obs_horizon=cfg["obs_horizon"], execute_horizon=h,
                                         img_size=cfg["img_size"], n_steps=s, guidance=g,
+                                        max_steps=args.max_steps,
                                         n_average=args.n_average, **obs_kwargs(cfg))
                             print(f"  {task:22s} steps={s:<4} w={g:<4} H={h:<3} "
+                                  f"T={args.max_steps:<4} "
                                   f"SR {100*r['success_rate']:5.1f}%  "
                                   f"步长 {r['mean_length']:5.1f}  "
                                   f"({time.perf_counter()-t0:.0f}s)", flush=True)
+                            mcfg = cfg.get("model", {})
                             w.writerow([args.ckpt.as_posix(), name, cfg["seed"], task,
                                         cfg.get("use_goal", False),
-                                        cfg.get("goal_slot", False), s, g, h,
+                                        cfg.get("goal_slot", False),
+                                        cfg.get("task_goal", False),
+                                        cfg.get("val_frac", 0.0),
+                                        cfg.get("steps", ""),
+                                        mcfg.get("d_model", ""),
+                                        mcfg.get("cfg_dropout", ""),
+                                        mcfg.get("ot_coupling", False),
+                                        cfg.get("global_cond", False),
+                                        "+".join(cfg.get("sources",
+                                                         ["motionplanning"])),
+                                        s, g, h, args.max_steps,
                                         args.n_average, not args.no_ema, args.n_episodes,
                                         f"{r['success_rate']:.4f}", f"{r['mean_length']:.2f}"])
                             fh.flush()

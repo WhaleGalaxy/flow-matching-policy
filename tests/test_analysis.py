@@ -6,6 +6,7 @@
 """
 import importlib.util
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -115,6 +116,130 @@ def test_report_never_averages_across_observation_configs():
     assert set(np.round(out["mean"], 2)) == {0.75, 0.06}
 
 
+def test_csv_migration_inserts_the_missing_column_in_place():
+    """结果表加一列时，旧文件必须就地补齐，且补在**正确的位置**。
+
+    补错位置不会报错：CSV 没有类型，错位之后 pandas 照样读出来，
+    只是从此每一行的数字都对到了错误的列上。
+    """
+    import csv as _csv
+    ru = _load("run_eval")
+    header = ["ckpt", "task", "max_steps", "success_rate"]
+    old = ["ckpt", "task", "success_rate"]
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "r.csv"
+        with open(f, "w", newline="") as fh:
+            w = _csv.writer(fh); w.writerow(old); w.writerow(["a.pt", "PickCube-v1", "0.60"])
+        ru.migrate_csv_header(f, header, migrations=(("max_steps", "300"),))
+        rows = list(_csv.reader(open(f)))
+    assert rows[0] == header
+    assert rows[1] == ["a.pt", "PickCube-v1", "300", "0.60"], \
+        f"补列补错了位置：{rows[1]}"
+
+
+def test_csv_migration_refuses_a_table_it_cannot_repair():
+    """少两列以上就该报错，而不是猜。混写两种 schema 是不会报错的那类错误。"""
+    import csv as _csv
+    ru = _load("run_eval")
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "r.csv"
+        with open(f, "w", newline="") as fh:
+            _csv.writer(fh).writerow(["ckpt", "success_rate"])
+        with pytest.raises(AssertionError):
+            ru.migrate_csv_header(f, ["ckpt", "task", "max_steps", "success_rate"])
+
+
+def test_report_never_averages_across_max_steps():
+    """评测步数上限是成绩的一部分：300 步和 100 步不是同一个任务难度。
+
+    ManiSkill 给 PickCube-v1 注册的上限是 50，官方基线用 100，本项目用 300。
+    三者放进同一张表平均，得到的数字不对应任何一种评测协议。
+    """
+    pd = pytest.importorskip("pandas")
+    mr = _load("make_report")
+    df = pd.DataFrame([
+        _row(max_steps=300, success_rate=0.60),
+        _row(max_steps=100, success_rate=0.35),
+    ])
+    out = mr.agg(mr.main_rows(mr.prepare(df)))
+    assert len(out) == 2, f"两种评测预算被合并了：\n{out}"
+    assert set(np.round(out["mean"], 2)) == {0.60, 0.35}
+
+
+def test_report_disambiguates_same_seed_appearing_in_two_runs():
+    """同一个 method 下同一个 seed 出现在两个 run 里，不可能是彼此的种子重复。
+
+    旧 CSV 没有训练配置列，光靠表里的信息分不开它们 —— 实测
+    outputs/2026-09-11/multitask.csv 的 8 个 fm run 就是这样被平均成 "4±2%" 的，
+    而 README 里那一行是 60/96/36。分不开时要用 run 名兜底，不能安静地平均。
+    """
+    pd = pytest.importorskip("pandas")
+    mr = _load("make_report")
+    df = pd.DataFrame([
+        _row(ckpt="outputs/fmnocfg_mt_tg60_s42/ckpt_60000.pt", seed=42,
+             success_rate=0.60),
+        _row(ckpt="outputs/fmwide_mt_tg60_s42/ckpt_60000.pt", seed=42,
+             success_rate=0.04),
+    ])
+    out = mr.agg(mr.main_rows(mr.prepare(df)))
+    assert len(out) == 2, f"两个不同的 run 被当成种子重复平均了：\n{out}"
+    assert set(np.round(out["mean"], 2)) == {0.60, 0.04}
+
+
+def test_report_label_keeps_every_qualifier():
+    """表里的名字必须能区分两行。丢掉限定词的话，4/95/8 和 60/96/36 会顶着
+    同一个名字并排出现，读表的人无从分辨。"""
+    mr = _load("make_report")
+    a = mr.label_of("fm/multi/fmnocfg_mt_tg60_s42")
+    b = mr.label_of("fm/multi/fmwide_mt_tg60_s42")
+    assert a != b, f"两个不同的 run 显示成了同一个名字：{a}"
+    assert "fmwide_mt_tg60_s42" in b
+    assert mr.label_of("fm") == mr.LABEL["fm"], "已登记的名字不该被改写"
+
+
+def test_report_counts_task_goal_as_a_goal_input():
+    """task_goal 是第三种"给了目标"的观测配置，漏掉它会把多任务主线标成 nogoal。"""
+    pd = pytest.importorskip("pandas")
+    mr = _load("make_report")
+    df = pd.DataFrame([_row(ckpt="outputs/fmnocfg_mt_tg60_s42/ckpt_60000.pt",
+                            use_goal=False, goal_slot=False, task_goal=True)])
+    assert "nogoal" not in mr.prepare(df).method.iloc[0]
+
+
+def test_report_never_averages_across_n_average():
+    """回归测试。n_average 是**另一个推理配置**，不是重复测量。
+
+    run_eval.py 一直把它写进 CSV，但它从没进过 make_report 的分组键，于是同一个
+    checkpoint 的 K=1/4/16 三行（实测 PickCube 60/56/53%）被当成同一配置的三次
+    重复测量，平均成 56.3%。这与 use_goal 那一课是同一个形状：列记了，
+    但汇总的时候没用上，而且不报错。
+    """
+    pd = pytest.importorskip("pandas")
+    mr = _load("make_report")
+    df = pd.DataFrame([
+        _row(n_average=1, success_rate=0.60),
+        _row(n_average=4, success_rate=0.56),
+        _row(n_average=16, success_rate=0.53),
+    ])
+    out = mr.agg(mr.main_rows(mr.prepare(df)))
+    assert len(out) == 1, f"取均值的消融混进了主表：\n{out}"
+    assert np.round(out["mean"].iloc[0], 2) == 0.60, \
+        f"主表要的是推理时实际执行的单样本，拿到的却是 {out['mean'].iloc[0]:.3f}"
+
+
+def test_report_never_averages_across_val_frac():
+    """留出集比例不同 = 训练数据不同 = 不同的实验，不能当成两个 seed 平均。"""
+    pd = pytest.importorskip("pandas")
+    mr = _load("make_report")
+    df = pd.DataFrame([
+        _row(ckpt="outputs/fm_mt_s42/ckpt_60000.pt", val_frac=0.0, success_rate=0.60),
+        _row(ckpt="outputs/fm_mt_v1_s42/ckpt_60000.pt", val_frac=0.1, success_rate=0.50),
+    ])
+    out = mr.agg(mr.main_rows(mr.prepare(df)))
+    assert len(out) == 2, f"两种训练数据配置被合并了：\n{out}"
+    assert set(np.round(out["mean"], 2)) == {0.60, 0.50}
+
+
 def test_report_keeps_each_method_at_its_own_default_operating_point():
     """主表要的是"各方法的默认工作点"，不是"所有步数的平均"。
     FM 10 步、DDPM 100 步、BC 一次前向。"""
@@ -142,3 +267,22 @@ def test_report_excludes_non_default_execute_horizon():
     ])
     rows = mr.main_rows(mr.prepare(df))
     assert len(rows) == 1 and float(rows.success_rate.iloc[0]) == 0.75
+
+
+def test_demo_composition_pads_short_panels_and_keeps_frame_count():
+    """动图合成：三个任务的长度不同，短的要用最后一帧补齐。
+
+    不补齐的话先结束的任务要么凭空消失（形状对不上直接崩），要么循环重放 ——
+    后者看起来像策略在反复尝试，把一次成功讲成了一次挣扎。
+    """
+    rd = _load("record_demo")
+    panels = [np.zeros((30, 64, 64, 3), np.uint8),
+              np.full((12, 64, 64, 3), 255, np.uint8),
+              np.zeros((7, 64, 64, 3), np.uint8)]
+    anim = rd.compose(panels, ["A", "B", "C"], scale=32, stride=3)
+    assert anim.shape[1] == 32 and anim.shape[2] == 32 * 3
+    idx = list(range(0, 30, 3))
+    expect = len(idx) + (0 if idx[-1] == 29 else 1)   # 末帧一定收进来
+    assert anim.shape[0] == expect, "抽帧数量不对"
+    # 最后一帧里，B 那一格应当还是它自己的最后一帧（白），不是黑或越界
+    assert anim[-1, 16, 32 + 16].max() > 200, "短序列没有被正确补齐"

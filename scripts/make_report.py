@@ -35,19 +35,102 @@ DEFAULT_STEPS = {"bc": 1, "bc_xattn": 1, "ddpm": 100, "fm": 10}
 DEFAULT_HORIZON = 8
 
 
+# 训练配置里会改变结论的那些轴，以及旧 CSV 缺列时填的"未知"。
+# 填"未知"而不是填默认值：旧 CSV 记不下当时的配置，硬填一个值就是在断言
+# 一件无法核实的事，而代价是旧行与新行被当成同一个配置的不同 seed。
+VARIANT_COLS = {
+    "task_goal": "?",      # 每任务取目标 actor；与 use_goal / goal_slot 是三种配置
+    "val_frac": "?",       # 留出比例。训练数据少 10% 是不同的实验
+    "steps": "?",          # 训练预算。20000 与 60000 步的多任务不是同一个实验
+    "d_model": "?",        # 容量。6.80M 与 15.01M 的结论相反
+    "cfg_dropout": "?",    # 训练时指令置空比例
+    "ot_coupling": "?",    # batch 内最优指派
+    "global_cond": "?",    # 非视觉 token 再经 AdaLN 注入
+    "sources": "?",        # 演示来源。混合来源是另一份数据
+    # 唯一一个评测侧的：每个 episode 的环境步数上限。ManiSkill 给 PickCube-v1
+    # 注册的是 50，官方基线用 100，本项目一直用 300 —— 预算不同的成功率不可比。
+    "max_steps": "?",
+}
+
+
+def label_of(m: str) -> str:
+    """method 串转成表里显示的名字，**限定词一个都不能丢**。
+
+    原来的写法是 `LABEL.get(m, LABEL.get(m.split("/")[0], m) + " · online")`：
+    只要 method 不在 LABEL 里就退回第一段，于是 "fm/multi/nogoal/fmwide_mt_tg60_s42"
+    和 "fm/multi/nogoal/fmnocfg_mt_tg60_s42" 在表里都显示成 "FM (Ours) · online"。
+    两行数字一个是 4/95/8 一个是 60/96/36，名字却一模一样 —— 读表的人没有任何
+    办法知道哪行是哪个实验。
+    """
+    if m in LABEL:
+        return LABEL[m]
+    head, *rest = m.split("/")
+    if rest and f"{head}/{rest[0]}" in LABEL:
+        base, rest = LABEL[f"{head}/{rest[0]}"], rest[1:]
+    else:
+        base = LABEL.get(head, head)
+    return " · ".join([base, *rest])
+
+
+def variant_tags(df, cols) -> "pd.Series":
+    """按 method 分组，把组内**确实变化了的**配置列拼成一个后缀。
+
+    为什么按 method 分组而不是看全表：cfg_dropout 这类列在 BC 和 FM 之间天然不同
+    （BC 根本没有这个旋钮），看全表的话每一行都会挂上一个毫无信息量的后缀。
+    要区分的是"同一个方法名下面其实是几个不同的实验"，那正是组内的变化。
+
+    这条规则是自适应的：三个 seed 跑同一个配置时没有任何列在变，后缀为空，
+    表格与现在一样干净；一旦混进了一个改了宽度或步数的 run，它立刻单独成行。
+    """
+    tag = pd.Series("", index=df.index)
+    for _, g in df.groupby("method", sort=False):
+        varying = [c for c in cols if g[c].nunique() > 1]
+        if not varying:
+            continue
+        tag.loc[g.index] = ["/" + ",".join(f"{c}={v}" for c, v in zip(varying, row))
+                            for row in g[varying].itertuples(index=False)]
+    return tag
+
+
 def main_rows(df: pd.DataFrame) -> pd.DataFrame:
     """主结果表用的行：各方法在自己的默认工作点、默认执行长度、无 CFG。"""
     # BC 没有采样步数这个旋钮，早期 CSV 里它继承了一个无意义的 10。
     # 对 bc 不筛步数，否则它会整行掉出主表。
     steps_ok = (df.model.map(DEFAULT_STEPS).eq(df.n_steps)
                 | df.model.isin(("bc", "bc_xattn")))
-    return df[steps_ok & df.execute_horizon.eq(DEFAULT_HORIZON) & df.guidance.eq(1.0)]
+    # n_average>1 是"取 K 个样本的均值"这个消融，和采样步数扫描一样不进主表：
+    # 推理时实际执行的是单样本。
+    n_avg = df.n_average if "n_average" in df else 1
+    return df[steps_ok & df.execute_horizon.eq(DEFAULT_HORIZON)
+              & df.guidance.eq(1.0) & (n_avg == 1)]
 
 
 def order_of(methods) -> list:
     """ORDER 里的先排前面，其余（如 --weights both 产生的 /online 变体）按名字跟后。"""
     known = [m for m in ORDER if m in methods]
     return known + sorted(m for m in methods if m not in ORDER)
+
+
+def drop_diverged(df: pd.DataFrame) -> pd.DataFrame:
+    """剔除训练发散那些 run 的评测行。
+
+    为什么要在这里做而不是靠人手删 CSV：发散的 run 由 src/train.py 的看门狗中止并
+    在 run 目录里留下 DIVERGED.txt，那一轮的权重不可用。此前这些行是**手工**从结果
+    表里删掉的，于是每写一个新的评测脚本就会重新引入一次 —— 2026-09-14 的
+    reference_100steps.csv 就是这样：它的种子循环写的是 42/123/7，而 7 正是发散的
+    那一轮，FM 的多任务 PushCube 因此被拖到 69±25%（真值 86% 量级）。
+
+    判据取自磁盘而不是 CSV 里的某一列：标记是训练时写的，评测脚本不知道它的存在，
+    而 checkpoint 路径足以定位 run 目录。
+    """
+    if "ckpt" not in df:
+        return df
+    marks = df.ckpt.map(lambda c: (Path(c).parent / "DIVERGED.txt").exists())
+    if marks.any():
+        runs = sorted({Path(c).parent.name for c in df.ckpt[marks]})
+        print(f"已剔除 {int(marks.sum())} 行：这些 run 训练时发散，权重不可用 "
+              f"（{', '.join(runs)}）。判据是 run 目录里的 DIVERGED.txt。\n")
+    return df[~marks].copy()
 
 
 def prepare(df: pd.DataFrame) -> pd.DataFrame:
@@ -73,6 +156,19 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     if "goal_slot" not in df:
         df["goal_slot"] = False
     df["goal_slot"] = df.goal_slot.astype(str).str.lower().isin(("true", "1"))
+    # n_average：K 个样本取均值估条件均值，与抽一个样本是**两个推理配置**，
+    # 不是同一配置的重复测量（实测 PickCube K=1/4/16 → 60/56/53%）。
+    # run_eval.py 一直在写这一列，但它从没进过下面的分组键 —— 于是同一个
+    # checkpoint 的三行会被当成重复测量平均成 56.3%，而且不报错。
+    if "n_average" not in df:
+        df["n_average"] = 1
+    df["n_average"] = df.n_average.fillna(1).astype(int)
+    # 训练配置列。旧 CSV 没有它们，一律填"未知"而不是填一个猜出来的默认值：
+    # 填默认值会让旧行与新行看起来是同一个配置，于是被当成彼此的 seed。
+    for col, default in VARIANT_COLS.items():
+        if col not in df:
+            df[col] = default
+        df[col] = df[col].fillna(default).astype(str)
     df["run"] = df.ckpt.map(lambda c: Path(c).parent.name)
     # 多任务 run 的命名：早期是 "fm_PickCube+StackCube+..."，现在是 "fm_mt_s42"
     df["multitask"] = df.run.str.contains(r"\+", regex=True) | df.run.str.contains("_mt")
@@ -81,15 +177,39 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     # 没接的 6% 平均成 29±40%，一个不对应任何实验的数字。
     # goal_slot 也算"给了目标"：有 goal_pos 的任务照常拿到它，没有的任务拿到
     # 一个显式置零并标了 valid=0 的槽，与"根本没这一路输入"不是一回事。
-    has_goal_input = df.use_goal | df.goal_slot
+    # task_goal 是第三种"给了目标"的观测配置：每个任务从自己的 actor 取目标位置。
+    # 漏掉它，多任务主线的 run 会被全部标成 "nogoal" —— 而它们恰恰是本项目里
+    # 目标接得最对的一批（PickCube 60% 对不给目标的 6%）。
+    # 旧 CSV 没有这一列，按 run 名里的 "_tg" 推断，与上面 use_goal 的推断同一路数。
+    tg = df.task_goal.where(df.task_goal != "?",
+                            df.run.str.contains("_tg").map({True: "True", False: "False"}))
+    has_goal_input = df.use_goal | df.goal_slot | tg.str.lower().isin(("true", "1"))
     df["method"] = df.method.where(has_goal_input, df.method + "/nogoal")
+    # 训练配置：组内确实变化了的那几列拼成后缀打进 method。
+    # 只打变化了的列，所以三个 seed 跑同一个配置时表格是干净的，±std 才真的是
+    # 种子间方差；而配置一旦混用，后缀会立刻把它们分开并写明差在哪一维。
+    df["method"] = df.method + variant_tags(df, VARIANT_COLS)
+    # 最后一道防线。上面那套机制只能用表里记下来的列去区分，旧 CSV 没有这些列
+    # （全是 "?"），于是 11 个不同配置的 run 仍然会被当成同一个方法的多个 seed。
+    # 但有一条无需任何额外信息就成立的判据：**同一个 method 下同一个 seed 出现在
+    # 两个不同的 run 里，它们不可能是彼此的种子重复。** 撞上就把 run 名打进
+    # method 并且大声说出来 —— 信息已经丢了，能做的是不要安静地给出错的数。
+    dup = df.groupby(["method", "seed"]).run.nunique()
+    ambiguous = sorted(set(dup[dup > 1].index.get_level_values("method")))
+    if ambiguous:
+        mask = df.method.isin(ambiguous)
+        print(f"警告：{ambiguous} 下同一个 seed 出现在多个 run 里，"
+              f"说明它们是不同的实验而表里没有列能区分（旧 CSV 缺训练配置列）。\n"
+              f"      已改用 run 名区分，避免把它们平均成一个不对应任何实验的数字。\n"
+              f"      重跑评测会写全 schema，届时这条警告自然消失。\n")
+        df.loc[mask, "method"] = df.loc[mask, "method"] + "/" + df.loc[mask, "run"]
     # 同一 checkpoint+配置可能被评测多次（主评测、步数消融的 10 步、CFG 消融的
     # w=1.0 会落在同一个键上）。这些是对同一个量的重复测量，**取平均**而不是
     # 任选一次 —— 实测同配置三次得到 4% / 5% / 7%，选最后一次等于让结果表取决于
     # 脚本的执行顺序。n_episodes 也进分组键，样本量不同的测量不会被混在一起。
     key = ["ckpt", "task", "use_goal", "goal_slot", "n_steps", "guidance",
-           "execute_horizon", "ema", "method", "model", "seed", "run", "multitask",
-           "n_episodes"]
+           "execute_horizon", "n_average", "ema", "method", "model", "seed", "run",
+           "multitask", "n_episodes", *VARIANT_COLS]
     g = df.groupby(key, as_index=False).agg(
         success_rate=("success_rate", "mean"),
         spread=("success_rate", lambda x: x.max() - x.min()),
@@ -125,7 +245,7 @@ def main_table(df: pd.DataFrame) -> str:
             r = sub[sub.task == t]
             cells.append(f"{100*r['mean'].iloc[0]:.0f}±{100*r['std'].iloc[0]:.0f}%"
                          if not r.empty else "—")
-        label = LABEL.get(m, LABEL.get(m.split("/")[0], m) + " · online")
+        label = label_of(m)
         name = f"**{label}**" if m == "fm" else label
         lines.append(f"| {name} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
@@ -148,7 +268,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path):
             ys = [100 * sub.loc[t, "mean"] if t in sub.index else 0 for t in tasks]
             es = [100 * sub.loc[t, "std"] if t in sub.index else 0 for t in tasks]
             ax.bar(xs, ys, w * 0.9, yerr=es, capsize=3,
-                   label=LABEL.get(m, m), color=COLOR.get(m, "#666"))
+                   label=label_of(m), color=COLOR.get(m, "#666"))
         ax.set_xticks(range(len(tasks))); ax.set_xticklabels([SHORT[t] for t in tasks])
         ax.set_ylabel("Success rate (%)"); ax.set_ylim(0, 100)
         ax.legend(); ax.grid(axis="y", alpha=0.3); ax.set_axisbelow(True)
@@ -168,7 +288,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path):
             ax.plot(grp.n_steps, 100 * grp.success_rate, "o",
                     color=COLOR.get(m, "#666"),
                     ls="--" if m == "ddpm" else "-",
-                    label=f"{LABEL.get(m,m)} · {SHORT.get(t,t)}")
+                    label=f"{label_of(m)} · {SHORT.get(t,t)}")
         if ax.get_lines():
             ax.set_xscale("log"); ax.set_xlabel("Sampling steps")
             ax.set_ylabel("Success rate (%)"); ax.grid(alpha=0.3)
@@ -242,6 +362,7 @@ def main():
     df = pd.read_csv(args.csv)
     df["success_rate"] = df.success_rate.astype(float)
     n_raw = len(df)
+    df = drop_diverged(df)
     df = prepare(df)
     if args.weights == "ema":
         df = df[df.ema]

@@ -1,0 +1,11 @@
+ckpt,model,seed,task,use_goal,goal_slot,task_goal,val_frac,steps,d_model,cfg_dropout,ot_coupling,global_cond,sources,n_steps,guidance,execute_horizon,max_steps,n_average,ema,n_episodes,success_rate,mean_length
+outputs/fm_pick_val10_s42/ckpt_20000.pt,fm,42,PickCube-v1,False,False,True,0.1,20000,256,0,False,False,motionplanning,10,1.0,8,300,1,False,100,0.6800,146.91
+outputs/ddpm_pick_val10_s42/ckpt_20000.pt,ddpm,42,PickCube-v1,False,False,True,0.1,20000,256,0,False,False,motionplanning,100,1.0,8,300,1,False,100,0.2300,258.49
+outputs/bcx_pick_val10_s42/ckpt_20000.pt,bc_xattn,42,PickCube-v1,False,False,True,0.1,20000,256,0,False,False,motionplanning,1,1.0,8,300,1,False,100,0.4900,197.40
+outputs/fm_pick_val10_s123/ckpt_20000.pt,fm,123,PickCube-v1,False,False,True,0.1,20000,256,0,False,False,motionplanning,10,1.0,8,300,1,False,100,0.7100,142.36
+outputs/ddpm_pick_val10_s123/ckpt_20000.pt,ddpm,123,PickCube-v1,False,False,True,0.1,20000,256,0,False,False,motionplanning,100,1.0,8,300,1,False,100,0.1000,278.41
+outputs/bcx_pick_val10_s123/ckpt_20000.pt,bc_xattn,123,PickCube-v1,False,False,True,0.1,20000,256,0,False,False,motionplanning,1,1.0,8,300,1,False,100,0.3700,225.84
+outputs/fm_pick_val10_s7/ckpt_20000.pt,fm,7,PickCube-v1,False,False,True,0.1,20000,256,0,False,False,motionplanning,10,1.0,8,300,1,False,100,0.4400,207.55
+outputs/ddpm_pick_val10_s7/ckpt_20000.pt,ddpm,7,PickCube-v1,False,False,True,0.1,20000,256,0,False,False,motionplanning,100,1.0,8,300,1,False,100,0.0600,285.84
+outputs/bcx_pick_val10_s7/ckpt_20000.pt,bc_xattn,7,PickCube-v1,False,False,True,0.1,20000,256,0,False,False,motionplanning,1,1.0,8,300,1,False,100,0.7400,134.12
+outputs/bc_pick_val10_s42/ckpt_20000.pt,bc,42,PickCube-v1,False,False,True,0.1,20000,256,0,False,False,motionplanning,1,1.0,8,300,1,False,100,0.0300,291.65
