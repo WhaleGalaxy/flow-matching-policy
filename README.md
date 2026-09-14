@@ -6,6 +6,12 @@
 对照组是**同编码器、同骨干、同参数量、同训练预算、同观测配置**的 Diffusion Policy
 和行为克隆。
 
+![demo](docs/figures/demo.gif)
+
+*一套多任务策略在三个任务上的闭环 rollout（`bcx_mt_val10_s42`，各取一局成功的
+episode：PickCube 69 步、PushCube 65 步、StackCube 91 步）。
+复现：`python scripts/record_demo.py --ckpt outputs/bcx_mt_val10_s42/ckpt_60000.pt`*
+
 项目要回答的不是"哪个模型成功率高"，而是：
 
 > **给定一批演示数据，生成式动作头（Flow Matching / Diffusion）值不值得用？
@@ -19,9 +25,12 @@ MSE 回归会塌到条件均值，而均值可能本身就非法"。**这个理�
   没有多模态可表示，于是同骨干的回归基线在多任务上反而更强。
 - 单任务下容量宽裕，Flow Matching 仍然领先（74% vs 52%）；
   任务数增加到三个、容量被摊薄之后，建模整个条件分布的代价压倒了它的表达优势。
-- 把 Flow Matching 加宽到 2.2 倍容量，**训练 loss 更低，成功率反而崩掉**
-  （0.1147 → 0.1134，60/96/36 → 4/95/8）。更好的生成模型给的是更好的**样本**，
-  而单峰数据上你要的是均值。
+- 把 Flow Matching 加宽到 2.2 倍容量，训练 loss 更低而成功率下降。曾把这解释成
+  生成式动作头特有的代价（"更好的样本，而单峰数据上你要的是均值"），
+  2026-09-14 补上**等宽度的回归基线对照**后这个解释不成立：同样加宽，回归基线
+  掉得更多（79 → 36，对 Flow Matching 的 65 → 48），而它的验证 loss 在第 10000 步
+  见底后回升 4.6%，是四条臂里唯一掉头的。**加宽的代价是普通过拟合，与动作头的
+  类型无关。**详见"容量"一节。
 
 这三条合起来是一个可操作的判据，不是一句"看情况"。
 
@@ -39,11 +48,47 @@ MSE 回归会塌到条件均值，而均值可能本身就非法"。**这个理�
 
 ## 结果
 
+下面标记区间里的速览表由 `scripts/make_report.py --write-readme` 从结果 CSV
+直接生成，是这一节唯一**机器写入**的地方；空着表示还没重新生成过。
+再往下的几张表是人写的，用来讲清楚某一组对比差在哪一维。
+两者的数字必须一致，不一致就说明有一边过期了。
+
+<!-- RESULTS_TABLE -->
+
+| Method | PickCube | PushCube | StackCube |
+|---|---|---|---|
+| BC cross-attn, multi-task · d_model=256 | 47±28% | 92±2% | 41±8% |
+| BC cross-attn, multi-task · d_model=384 | 36±0% | 91±0% | 47±0% |
+| Diffusion Policy, multi-task · cfg_dropout=0.0 | 6±3% | 95±2% | 1±1% |
+| Diffusion Policy, multi-task · cfg_dropout=0.2 | 7±0% | 98±0% | 0±0% |
+| FM (Ours, multi-task) · d_model=256 | 33±28% | 95±5% | 18±11% |
+| FM (Ours, multi-task) · d_model=384 | 48±0% | 93±0% | 18±0% |
+
+![results_main](docs/figures/results_main.png)
+
+*成功率为 100 episode 的评测结果，多 seed 取 mean±std；推理权重：在线（非 EMA）。复现：`python scripts/make_report.py --weights online`*
+
+<!-- /RESULTS_TABLE -->
+
 ### 单任务受控对比（PickCube，100 episode，在线权重）
 
-同编码器、同 6.80M 可训练参数、同 20000 步、同样接入目标位置：
+同编码器、同 6.80M 可训练参数、同 20000 步、同样接入目标位置。
+
+**主结果（10% 留出集，3 个随机种子，mean±std）：**
 
 | 方法 | 采样步数 | 成功率 |
+|---|---|---|
+| **Flow Matching** | 10 | **61 ± 15%** |
+| BC · cross-attention 读出 | 1 次前向 | 53 ± 19% |
+| Diffusion Policy | 100 | 13 ± 9% |
+| BC · 平均池化读出 | 1 次前向 | 3% *(n=1)* |
+
+单任务上 Flow Matching 领先回归基线 8 个点、领先 Diffusion 48 个点。
+前一个差距在 ±15/±19 的种子噪声里要谨慎读，后一个不在。
+
+早期在**全量数据、单个种子**下的同一张表（下文的诊断跑在这批 checkpoint 上）：
+
+| 方法（全量数据，单种子） | 采样步数 | 成功率 |
 |---|---|---|
 | **Flow Matching** | 10 | **74%** |
 | BC · cross-attention 读出 | 1 次前向 | 52% |
@@ -84,16 +129,39 @@ PushCube 那一行是探针的一次**预测检验**：ManiSkill 在视觉观测
 PushCube 的 `goal_pos`，因为设计者认为它应该被看见。同一个探针、同样的留出集协议，
 在一个它没见过的任务上独立证实了这一点。
 
-100 episode，60000 步（每个任务分到的梯度步数与单任务的 20000 步相当）：
+100 episode，60000 步（每个任务分到的梯度步数与单任务的 20000 步相当）。
+
+**主结果（10% 留出集，3 个随机种子，mean±std）：**
 
 | 方法 | 采样步数 | PickCube | PushCube | StackCube |
+|---|---|---|---|---|
+| BC · cross-attention | 1 次前向 | **47 ± 28%** | 92 ± 2% | **41 ± 8%** |
+| Flow Matching | 10 | 33 ± 28% | **95 ± 5%** | 18 ± 11% |
+| Diffusion Policy | 100 | 6 ± 3% | 95 ± 2% | 1 ± 1% |
+
+**PickCube 那一列分不出高下** —— 种子间标准差就是 ±28 个百分点（同一配置三个种子
+实测 13 / 22 / 65%），它盖过了 FM 与 BC 的差距。能说的是 StackCube（41 对 18）
+和 Diffusion 那一行。
+
+**而 Diffusion 那一行是可复现的弱，不是抽到了坏种子。** 它的三个种子在 PickCube 上
+是 8 / 7 / 3%（±3），而同样三个种子下 FM 是 13 / 22 / 65、BC 是 28 / 35 / 79。
+需要注意 6% 已经贴近地板，低方差里有一部分是地板效应，不能反过来说成
+"Diffusion 更稳定"；能说的是**"基线没调好"这个解释被三个种子排除了**。
+
+作为对照，下面是本仓库早期在**全量数据、单个种子**下的同一张表。下文"为什么
+Flow Matching 在多任务上输了"一节的所有诊断都跑在这一批 checkpoint 上：
+
+| 方法（全量数据，单种子） | 采样步数 | PickCube | PushCube | StackCube |
 |---|---|---|---|---|
 | BC · cross-attention | 1 次前向 | **90%** | 94% | **48%** |
 | Flow Matching | 10 | 60% | **96%** | 36% |
 | Diffusion Policy | 100 | 44% | 92% | 3% |
 
-Flow Matching 稳赢 Diffusion，且只用十分之一的采样步数；但输给同条件的回归基线。
-**这个方向与单任务相反**，下一节解释为什么。
+两张表的方向一致：Flow Matching 稳赢 Diffusion 且只用十分之一的采样步数，
+但输给同条件的回归基线。**这个方向与单任务相反**，下一节解释为什么。
+注意 Diffusion 从 44% 掉到 8%，跟着的是那 10% 的数据削减而不是别的 ——
+同样的削减下 Flow Matching 是 63 → 65，纹丝不动。**Diffusion 对数据量远更敏感**，
+这本身是一条选型依据。
 
 作为对照，这个仓库先前的多任务数字是 3/3/0%，当时把根因写成"统一观测空间与提供
 显式目标不可兼得"的架构冲突。冲突不存在：冲突只在目标**从哪来**，不在目标**是什么**。
@@ -128,16 +196,35 @@ K=1/4/16 → 60/56/53%，**不但没帮助还单调变差**。变差本身有信
 FM 用 16 个样本估出的条件均值，误差仍是 BC 的 1.5 倍。而夹爪那一列说明
 FM 的样本**结构上是干净的** —— 它没有病，就是估得不够准。
 
-**加容量让它更差。** 把 FM 从 6.80M 加宽到 15.01M：
+**加容量让它更差。** 把 FM 从 6.80M 加宽到 15.01M（全量数据、单种子）：
 
 | | 训练 loss | PickCube | PushCube | StackCube |
 |---|---|---|---|---|
 | FM 6.80M | 0.1147 | 60% | 96% | 36% |
 | FM 15.01M | **0.1134** | **4%** | 95% | **8%** |
 
-loss 更低、策略更差，而且不是没训好（loss 曲线正常下降）。这与前面的诊断一致：
-容量更大 → 条件分布拟合得更忠实 → 采样更忠实地复现演示噪声 → 控制更差。
-**单峰数据上你要的是均值，而更好的生成模型给你的是更好的样本。**
+loss 更低、策略更差，而且不是没训好（loss 曲线正常下降）。当时把它解释成
+"容量更大 → 条件分布拟合得更忠实 → 采样更忠实地复现演示噪声 → 控制更差"，
+也就是生成式动作头特有的代价。
+
+**这个解释有一个没被排除的竞争假设：加宽就是会过拟合，跟动作头的类型无关。**
+分开两者只需要一个对照 —— 把同样的宽度给等条件的回归基线。2026-09-14 补上了
+（留出集，seed 42）：
+
+| d_model | 参数量 | PickCube | PushCube | StackCube | 验证 loss 形态 |
+|---|---|---|---|---|---|
+| Flow Matching 256 | 6.80M | 65% | 90% | 19% | 52500 步见底，末尾持平 |
+| Flow Matching 384 | 15.01M | 48% | 93% | 18% | 45000 步见底，末尾 +1.1% |
+| BC · cross-attn 256 | — | 79% | 92% | 50% | 42500 步见底，末尾 +0.6% |
+| **BC · cross-attn 384** | — | **36%** | 91% | 47% | **10000 步见底，末尾 +4.6%** |
+
+**回归基线掉得更多（−43 个点，对 FM 的 −17），而且它是四条臂里唯一验证 loss
+掉头的那条。**原解释不成立：加宽的代价是普通过拟合，不是生成式动作头特有的。
+
+留出集在这里买到的东西很具体：过拟合从"由成功率反推"变成了**直接观测**。
+同时要注意，留出集上 FM 加宽的代价是 65 → 48，比全量数据那次的 60 → 4 温和得多，
+而单种子比较落在 ±28 的种子噪声里 —— **容量这个变量在现有数据下判不了方向**，
+能确定的只有"BC 的加宽版本在过拟合"这一条。
 
 一句话收束：
 
@@ -172,7 +259,45 @@ PickCube 的链条是 接近 → 抓取 → 送达 → 静止。环境自己就�
 
 ![failure attribution](docs/figures/failure_modes.png)
 
+四个方法在单任务 PickCube 上的分段（100 局，seed 42）：
+
+| | 未接近 | 接近未抓取 | 抓取未送达 | 送达未静止 | 成功 |
+|---|---|---|---|---|---|
+| Flow Matching | 6% | 1% | 24% | 1% | **68%** |
+| BC · cross-attn | 5% | 1% | 39% | 6% | 49% |
+| Diffusion Policy | 18% | 1% | 47% | 11% | 23% |
+| BC · mean-pool | **59%** | 3% | 35% | 0% | 3% |
+
 一个成功率数字说不出"没学会看"和"学会了但停不稳"的区别，而这两者的下一步完全不同。
+这张表里有两件事是成功率读不出来的：
+
+**mean-pool 基线的失败有 59% 是"根本没接近"**，而不是抓不稳或送不到。
+把目标稀释成 1/83 之后，策略连该往哪走都不知道 —— 这给"读出方式吃掉 49 个
+百分点"那条结论补上了机制，它不是"差一点"，是缺了导航所需的信息。
+
+**四个方法的头号失败都是"抓取未送达"（24–47%）。** 抓取这一段几乎没有区分度
+（接近未抓取全是 1–3%），方法之间的差别集中在抓到之后能不能送到目标。
+而 PickCube 的目标是每局随机、相机里看不见、只能从本体状态读的标记。
+
+**同一个方法、不同种子的差距也能这样拆开。** FM 的两个种子在 PickCube 上是
+65% 和 13%，而它们的验证 loss 几乎一样（0.1510 对 0.1686），评测用的还是完全相同的
+100 个初始场景。把这 52 个百分点按链条分段：
+
+| PickCube，100 局 | 未接近 | 接近未抓取 | **抓取未送达** | 送达未静止 | 成功 |
+|---|---|---|---|---|---|
+| FM seed 42 | 9% | 1% | **25%** | 0% | **65%** |
+| FM seed 123 | 5% | 1% | **76%** | 5% | **13%** |
+
+![seed gap attribution](docs/figures/failure_seed_gap.png)
+
+**差距几乎全部落在"抓取未送达"一段（25% → 76%，+51 个点），前两段基本相同。**
+两个种子都学会了看见方块并抓住它，区别在抓到之后能不能把它送到目标位置 ——
+而 PickCube 的目标正是那个每局随机、相机里看不见、只能从本体状态读的标记
+（见上面的观测充分性一节）。也就是说这 ±28 个百分点的种子方差不是"有的种子没学会
+感知"，而是**有的种子没学会用那一路目标输入**。
+
+这也说明为什么单看成功率会误判：两个种子的训练曲线和验证 loss 都正常，
+差别只在一个特定的子能力上，而那个子能力恰好依赖项目里最脆弱的一路输入。
 
 ### 部署可行域：成功率 vs 可达控制频率（支撑结果）
 
@@ -334,16 +459,32 @@ RUN_DIR=outputs/$(date +%F) setsid nohup env QUEUE_PLAN=scripts/queue_plan_main.
 
 诚实起见，这些都是**没做**而不是"不重要"。
 
-- **没有留出验证集。** 所有 episode 都进了训练，所以开环的动作复现误差报的是
-  **训练集拟合误差**，不是泛化误差。用于方法之间的比较是成立的（数据访问完全相同），
-  但不能当作泛化能力的证据。这是最该先补的一条。
-- **主要结论只有 1–2 个 seed。** 成功率的测量噪声实测约 3 个百分点，
-  小于这个尺度的差距不成立（例如多任务 PushCube 上 FM 96% 与 BC 94% 不算差距）。
-  有了特征缓存之后一轮只要 10 分钟，多 seed 是现实的，只是还没跑。
+- **评测预算比任务自己的定义宽。** `src/evaluate.rollout` 每局给 300 步，
+  而 ManiSkill 给 `PickCube-v1` 注册的 `max_episode_steps` 是 50，
+  官方基线脚本用的是 100。环境的 `truncated` 返回值代码里收下了却从未使用
+  （实测环境不会自动重置，所以不是"多段 episode 被拼起来"，只是预算更宽）。
+  **内部对比不受影响** —— 三个方法拿到同一个预算 —— 但与任何已发表数字的比较
+  都必须换到同一个预算上，而这个偏差朝着对本项目有利的方向。
+  `max_steps` 现已是结果表 schema 的一等列，主结果另有一份 100 步的重测。
+  与 ManiSkill3 官方基线的完整口径对齐见
+  [docs/external_reference.md](docs/external_reference.md)。
+- ~~**没有留出验证集。**~~ **已补上。** 按 episode 划分 10% 留出集
+  （`val_frac=0.1`, `split_seed=0`），训练中每 2500 步测验证 loss，主结果全部重跑在
+  留出协议下。附带一个发散看门狗：验证 loss 连续两次高出历史最低的 1.5 倍即中止，
+  该轮结果自动排除出结果表（`outputs/fm_mt_val10_s7/DIVERGED.txt` 是触发过的一例）。
+- **种子噪声比原先以为的大一个数量级，而 Diffusion 臂还差两个种子。**
+  原先写的"测量噪声约 3 个百分点"说的是**同一配置重复评测**的跨度（实测同配置
+  两次是 4% 和 8%），那是测量噪声的下限；而**种子间**的标准差在 PickCube 上实测是
+  **±28 个百分点**（同一配置三个种子 13 / 22 / 65%）。主结果现已按 3 个种子报告
+  mean±std，分不出来的格子明写分不出来。多任务的 Diffusion 臂目前只有 1 个种子，
+  不能与另外两行并排读，正在补。
 - **单任务与多任务的结论方向相反，机制只有诊断没有直接验证。** 诊断是
   "容量被三个任务摊薄后，建模整个条件分布的代价压倒表达优势"，
-  支撑证据是加容量反而更差、开环误差大 1.5 倍、取均值无效。
-  但"容量"这个变量没有被单独扫过一条曲线。
+  支撑证据是开环误差大 1.5 倍、取均值无效。
+  "加容量反而更差"这一条**已不再作为支撑证据** —— 等宽度的回归基线对照显示它
+  掉得更多（79 → 36，对 FM 的 65 → 48），说明那是普通过拟合而非生成式动作头特有。
+  容量这一维现在有 256 / 384 两个点 × 两种动作头，但 128 那一档还没跑，
+  而且单种子比较落在 ±28 的种子噪声里，**方向仍然判不了**。
 - **没有造出干净的多模态数据。** 混合运动规划与 PPO 两种解法后，条件散度到 1.05
   但双峰系数只有 0.547（正态参考 0.555），是很宽的平顶单峰而非双峰。
   也就是说"生成式动作头在多模态数据上更强"这条推论，本项目**没有**在实验上证实，
@@ -364,6 +505,11 @@ RUN_DIR=outputs/$(date +%F) setsid nohup env QUEUE_PLAN=scripts/queue_plan_main.
 - **架构仍然是 VLA 的形状而非 VLA。** DINOv2 与 SigLIP 文本塔是两个独立预训练的
   骨干，只在 token 层面拼接，两个模态没有在骨干内部对齐。换成单个视觉语言骨干
   （PaliGemma 一类）是明确的下一步，8GB 显存下要靠特征缓存才可行。
+  更要紧的是**三个任务观测不到这个差别**：指令的差异全在动词上，
+  场景里也不存在"哪一块"的歧义，所以本项目的语言条件是**任务选择而非指代消解**。
+  先有需要语言的任务，再谈需要更好的语言骨干。
+  架构在 VLA 设计空间里的位置、以及项目的测量对 VLA 的几个设计选择分别意味着
+  什么，见 [docs/vla.md](docs/vla.md)。
 
 ## 目录结构
 
@@ -424,12 +570,23 @@ demonstrations the conditional action distribution is a *wide unimodal* one
 matched-capacity regression baseline with the same cross-attention readout wins in the
 multi-task setting.
 
-**Headline numbers.** Single task (PickCube, 100 episodes, identical conditions):
-Flow Matching 74%, BC with cross-attention readout 52%, Diffusion Policy 33%, BC with
-mean-pool readout 3%. Multi-task (PickCube + PushCube + StackCube, 60k steps): BC
-90/94/48, Flow Matching 60/96/36, Diffusion 44/92/3. Flow Matching beats Diffusion
-everywhere and does so with a tenth of the sampling steps; it loses to the regression
-baseline once capacity is shared across three tasks.
+**Headline numbers** (10% held-out split, three seeds, mean±std). Single task
+(PickCube, 100 episodes, identical conditions): Flow Matching **61±15%**, BC with
+cross-attention readout 53±19%, Diffusion Policy 13±9%, BC with mean-pool readout 3%
+*(n=1)*. Multi-task (PickCube + PushCube + StackCube, 60k steps): BC
+**47±28 / 92±2 / 41±8%**, Flow Matching 33±28 / 95±5 / 18±11%, Diffusion
+6±3 / 95±2 / 1±1%.
+
+Flow Matching beats Diffusion everywhere and does so with a tenth of the sampling
+steps; it loses to the regression baseline once capacity is shared across three tasks.
+Read the PickCube column with care: the seed-to-seed standard deviation there is ±28
+points (13 / 22 / 65% for one configuration across three seeds), which swamps the
+FM-vs-BC gap. The separable results are StackCube (41 vs 18) and the Diffusion row — and that row is
+a *reproducible* weakness rather than an unlucky seed: Diffusion scores 8 / 7 / 3% on
+PickCube across the same three seeds on which Flow Matching scores 13 / 22 / 65% and BC
+scores 28 / 35 / 79%. (6% is close to the floor, so the small spread is partly a floor
+effect — the claim is not that Diffusion is more stable, only that "the baseline was
+undertuned" is ruled out by three seeds.)
 
 **Three findings that changed the conclusion.** (1) The previously reported "FM 75% vs
 BC 4%" was 49 points readout architecture and 23 points modelling choice: the old BC
@@ -437,9 +594,14 @@ mean-pooled 83 context tokens, diluting the goal to 1/83. (2) The Diffusion base
 was dead, pinned at exactly 2.0% across every configuration, because a cosine schedule
 leaves `alphas_cumprod[-1] ≈ 2.4e-7` and DDIM starts there, amplifying the noise
 prediction error by ~2000x. (3) Widening Flow Matching from 6.80M to 15.01M parameters
-*lowered* the training loss (0.1147 → 0.1134) and *collapsed* the success rate
-(60/96/36 → 4/95/8): a better generative model returns a better *sample*, and on
-unimodal data what you want is the mean.
+*lowered* the training loss (0.1147 → 0.1134) while the success rate fell. This was
+originally explained as a cost specific to generative action heads ("a better
+generative model returns a better *sample*, and on unimodal data what you want is the
+mean"). A matched-width regression baseline, added 2026-09-14, does not support that:
+widened the same way, the regression baseline falls *further* (79 → 36, against Flow
+Matching's 65 → 48), and it is the only arm whose validation loss turns up — bottoming
+at step 10k and rising 4.6%. The cost of widening is ordinary overfitting, not
+something specific to the action head.
 
 **The most useful part of the repository is the three pre-training checks**, each
 distilled from a wasted training run: action-representation signal-to-noise,
@@ -447,6 +609,9 @@ observability of the task-relevant quantities under a held-out ridge probe, and 
 modality of the conditional action distribution. Each takes minutes and each can veto
 a training run. See [docs/debugging.md](docs/debugging.md) for how each was found.
 
-Known limitations are listed above (中文) and are not small: no held-out split, one or
-two seeds, and no dataset with genuine multimodality, which means the converse claim
-("generative heads win when the data is multimodal") is **not** demonstrated here.
+Known limitations are listed above (中文) and are not small. A held-out split and
+three-seed reporting are now in place, but the multi-task Diffusion arm still has only
+one seed, the capacity axis cannot be called in either direction under ±28-point seed
+noise, and there is still no dataset with genuine multimodality — which means the
+converse claim ("generative heads win when the data is multimodal") is **not**
+demonstrated here.
