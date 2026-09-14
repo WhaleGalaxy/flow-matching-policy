@@ -86,6 +86,9 @@ class ManiskillDataset(Dataset):
         feature_cache: str | Path | None = None,
         source: str = "motionplanning",
         clip_actions: bool = True,
+        val_frac: float = 0.0,
+        split: str = "train",
+        split_seed: int = 0,
     ):
         self.h5_path = Path(h5_path)
         self.task = task
@@ -102,6 +105,11 @@ class ManiskillDataset(Dataset):
         # 合并归一化之后运动规划的动作被压到 0.06 的尺度，模型分辨不出来，
         # 实测混合数据上 FM 和 BC 双双掉到 3%。
         self.clip_actions = clip_actions
+        # 留出集的三个参数要能从 checkpoint 里读回来：评测脚本必须用**同一个**划分，
+        # 否则"留出集误差"里混进了训练过的 episode，而这不会报错。
+        self.val_frac = val_frac
+        self.split = split
+        self.split_seed = split_seed
         # goal_slot：所有任务都产出 qpos(9) + goal(3) + valid(1) = 13 维，
         # 演示里没有 goal_pos 的任务填零并把 valid 置 0。use_goal 那种"有就 12 维、
         # 没有就 9 维"的做法让 proprio_dim 在任务间跳动，多任务根本拼不起来。
@@ -139,6 +147,7 @@ class ManiskillDataset(Dataset):
             names = sorted(f.keys(), key=lambda s: int(s.split("_")[1]))
             if max_episodes is not None:
                 names = names[:max_episodes]
+            kept, lengths = [], {}
             for name in names:
                 ep = f[name]
                 if success_only and not bool(np.asarray(ep["success"])[-1]):
@@ -146,9 +155,16 @@ class ManiskillDataset(Dataset):
                 T = ep["actions"].shape[0]
                 if T < 1:
                     continue
-                self.episode_lengths[name] = T
+                kept.append(name)
+                lengths[name] = T
+            # 切分放在筛选**之后**：先按 success_only / max_episodes 定下候选集，
+            # 再从候选集里划留出。反过来（先切再筛）会让留出比例随失败轨迹的
+            # 分布漂移，两个来源之间还对不齐。
+            self.episode_names = split_episodes(kept, val_frac, split_seed, split)
+            for name in self.episode_names:
+                self.episode_lengths[name] = lengths[name]
                 # start_t 可取 0..T-1：动作块不足 act_horizon 时在末尾重复最后一个动作
-                self.index.extend((name, t) for t in range(T))
+                self.index.extend((name, t) for t in range(lengths[name]))
 
             first = f[names[0]]
             self.act_dim = first["actions"].shape[-1]
@@ -173,7 +189,24 @@ class ManiskillDataset(Dataset):
 
     @property
     def feat(self) -> np.ndarray:
-        """每个 DataLoader worker 各自 mmap 一次。fork 出来的进程共享同一份页缓存。"""
+        """每个 DataLoader worker 各自 mmap 一次。fork 出来的进程共享同一份页缓存。
+
+        **不要加 MADV_RANDOM。** 三个任务的特征缓存合计 15.3GB，与整机内存相当，
+        2026-09-13 凌晨内核为了留住这些页面回收了别的进程的匿名内存，把用户的
+        编辑器杀掉了。当时试过用 MADV_RANDOM 关掉顺序预读来省内存，实测：
+
+            可用内存   557-868MB  ->  5734MB
+            训练吞吐   26.5 it/s  ->   6.0 it/s
+
+        内存确实省下来了，但每次缺页都要单独去磁盘取，吞吐掉了四倍多，一轮
+        60000 步从 38 分钟变成 1 小时 40 分钟。**这笔买卖不划算**，因为内存的
+        主要改善来自把 DataLoader worker 从 3 个降到 2 个（少了一个 4GB 量级的
+        进程），而不是来自关预读。所以保留 num_workers=2，去掉这个提示。
+
+        真要再省内存，方向是减小缓存本身（当前 fp16、81 patch、384 维），
+        或者给训练进程套一个内存 cgroup —— 后者在本机不可行，内存控制器在
+        cgroup v1 上，用户级进程拿不到委派权限。
+        """
         if self._feat is None:
             self._feat = np.load(self.feature_cache / "feat.f16", mmap_mode="r")
         return self._feat
@@ -253,6 +286,39 @@ class ManiskillDataset(Dataset):
                 self._file.close()
             except Exception:
                 pass
+
+
+def split_episodes(names: list[str], val_frac: float = 0.0, split_seed: int = 0,
+                   split: str = "train") -> list[str]:
+    """把 episode 名单切成训练集与留出集。
+
+    **切在 episode 层面，不是样本层面。** 同一条轨迹相邻时刻的观测几乎一模一样
+    （相机不动，机械臂挪了几毫米），按样本随机切的话，留出集里的每一帧在训练集里
+    都有一个近乎重复的邻居，量出来的"泛化误差"其实还是拟合误差 —— 而且它会好看
+    得多，于是这个错误不会被任何数字暴露出来。
+
+    **划分只由 split_seed 决定，与训练的 seed 无关。** 多 seed 实验要量的是
+    "换一个初始化，结论还成不成立"；如果每个 seed 的数据划分也跟着变，量出来的
+    方差里就混进了"换一批数据"，多 seed 本来要回答的问题反而答不了。同理，
+    不同方法之间做对照时三者必须拿到逐条相同的训练集，所以默认 split_seed=0
+    写死在配置里，而不是继承 cfg.seed。
+
+    val_frac=0 时留出集为空，训练集是全部 —— 这是本项目 2026-09-12 之前所有
+    结果的配置，保留它是为了那些结果仍能原样复现。
+    """
+    assert split in ("train", "val", "all"), f"未知的 split: {split}"
+    if split == "all":
+        return list(names)
+    if val_frac <= 0:
+        return list(names) if split == "train" else []
+    n_val = int(round(val_frac * len(names)))
+    assert 0 < n_val < len(names), (
+        f"val_frac={val_frac} 在 {len(names)} 条轨迹上切出 {n_val} 条留出，"
+        f"不是一个可用的划分")
+    perm = np.random.default_rng(split_seed).permutation(len(names))
+    val = {names[i] for i in perm[:n_val]}
+    # 保持原有顺序返回，便于人读日志时对得上 episode 编号
+    return [n for n in names if (n in val) == (split == "val")]
 
 
 def build_proprio(qpos, goal_pos=None, goal_slot: bool = False) -> torch.Tensor:

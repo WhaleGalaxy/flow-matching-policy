@@ -23,6 +23,26 @@ max_episodes: null       # null = 用全部演示
 num_workers: 6
 batch_size: 128
 
+# 留出验证集：按 episode 切出这个比例不参与训练，用来量泛化误差。
+# 本项目 2026-09-12 之前所有结果都是 val_frac=0（全部 episode 进训练），所以
+# scripts/action_accuracy.py 报的开环误差是**拟合**误差而不是泛化误差，
+# 这是 README"已知局限"里的第一条。
+#
+# 注意闭环成功率不受影响：每个 eval episode 都是环境的一次新随机初始化，
+# 从来就不是训练集里的轨迹。留出集修的是两件别的事 ——
+#   1. 开环动作复现误差变成真正的泛化误差
+#   2. 有了 val loss 曲线，"加容量 → loss 更低但策略更差"才能被直接验证成过拟合，
+#      而不是只能从成功率反推
+#
+# 改这个值会改变训练数据，所以它进结果表的 schema（见 scripts/run_eval.py），
+# 不同 val_frac 的 run 不能被汇总脚本平均到一起。
+val_frac: 0.1
+# 划分只由它决定，**不跟随 cfg.seed**。多 seed 要量的是"换一个初始化结论还成不成立"，
+# 划分跟着变的话，方差里就混进了"换一批数据"。见 src/data/dataset.split_episodes。
+split_seed: 0
+# 每次存 checkpoint 时用多少个 batch 估 val loss（固定 RNG，step 之间可比）
+val_batches: 20
+
 # ---- 优化 ----
 lr: 1.0e-4
 weight_decay: 1.0e-4

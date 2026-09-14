@@ -30,13 +30,15 @@ from src.models.policy import (BCPolicy, BCXAttnPolicy, DDPMPolicy, EMA,  # noqa
                                trainable_state_dict)
 
 
-def build_dataset(cfg):
+def build_dataset(cfg, split: str = "train"):
     kw = dict(obs_horizon=cfg.obs_horizon, act_horizon=cfg.act_horizon,
               img_size=cfg.img_size, max_episodes=cfg.max_episodes,
               use_goal=cfg.get("use_goal", False),
               goal_slot=cfg.get("goal_slot", False),
               task_goal=cfg.get("task_goal", False),
-              feature_cache=cfg.get("feature_cache", None))
+              feature_cache=cfg.get("feature_cache", None),
+              val_frac=cfg.get("val_frac", 0.0),
+              split_seed=cfg.get("split_seed", 0), split=split)
     tasks = list(cfg.tasks)
     sources = list(cfg.get("sources", ["motionplanning"]))
     if len(sources) > 1:
@@ -70,6 +72,58 @@ def build_policy(cfg, act_dim, proprio_dim):
                     time_dist=cfg.model.get("time_dist", "uniform"),
                     time_loc=cfg.model.get("time_loc", 0.0),
                     time_scale=cfg.model.get("time_scale", 1.0), **gen)
+
+
+def diverging(vl: float, best: float, bad: int, step: int, total: int,
+              ratio: float = 1.5, warmup_frac: float = 0.2) -> int:
+    """更新"验证 loss 连续变坏了几次"的计数。返回新的计数，>=2 即判为发散。
+
+    为什么用验证 loss 而不是训练 loss：训练 loss 被 batch 噪声盖着，涨起来不明显；
+    验证 loss 固定了数据与 RNG，是一条干净的曲线。2026-09-12 那次发散里，
+    训练 loss 从 0.144 涨到 0.687 花了两万五千步才显眼，而验证 loss 在
+    0.158 → 0.277 那一步就已经翻了 1.76 倍。
+
+    为什么要连续两次：单次抖动不该判死刑。
+    为什么前 20% 不生效：早期 loss 本来就在剧烈下降，最低点还没稳定下来。
+    """
+    if step <= warmup_frac * total:
+        return 0
+    return bad + 1 if vl > ratio * best else 0
+
+
+@torch.no_grad()
+def val_loss(policy, loader, cfg, gen, n_batches: int) -> float:
+    """留出集上的 loss。
+
+    **RNG 必须固定住。** FM 和 DDPM 的 loss 每算一次都要现采流时间 t 和噪声 x0，
+    直接算出来的读数带着这层采样噪声，step 之间不可比 —— 曲线的抖动会盖过真正的
+    变化，而这正是这条曲线要看的东西（加容量之后 val loss 有没有掉头向上）。
+    所以每次都用同一批数据、同一组 t、同一组 x0，差异就只来自模型本身。
+
+    算完把全局 RNG 状态还回去：val 消耗掉的随机数如果不还，训练侧的数据增广、
+    CFG dropout 序列就会随"这一步有没有算 val"而改变，实验不再可复现。
+    """
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    torch.manual_seed(12345)
+    gen.manual_seed(12345)          # 让每次取到的是**同一批** val 样本
+    was_training = policy.training
+    policy.eval()
+    total, n = 0.0, 0
+    for i, batch in enumerate(loader):
+        if i >= n_batches:
+            break
+        for k in ("rgb", "proprio", "action"):
+            batch[k] = batch[k].to(cfg.device, non_blocking=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cfg.bf16):
+            total += float(policy.compute_loss(batch))
+        n += 1
+    if was_training:
+        policy.train()
+    torch.set_rng_state(cpu_state)
+    if cuda_state is not None:
+        torch.cuda.set_rng_state_all(cuda_state)
+    return total / max(1, n)
 
 
 def lr_at(step, cfg):
@@ -109,6 +163,32 @@ def main(cfg: DictConfig) -> None:
         persistent_workers=cfg.num_workers > 0, pin_memory=True,
     )
 
+    # ---- 留出集 ----
+    # 划分由 split_seed 决定而非 cfg.seed，所以同一批对照实验（FM / DDPM / BC）
+    # 拿到的是逐条相同的训练集与留出集。见 src/data/dataset.split_episodes。
+    val_loader, val_gen = None, None
+    if cfg.get("val_frac", 0.0) > 0:
+        val_dataset, _, val_subsets = build_dataset(cfg, split="val")
+        n_val_ep = sum(len(d.episode_lengths) for d in val_subsets)
+        n_tr_ep = sum(len(d.episode_lengths) for d in subsets)
+        print(f"留出集: {len(val_dataset):,} 个样本 / {n_val_ep} 条轨迹"
+              f"（训练 {n_tr_ep} 条，val_frac={cfg.val_frac} split_seed={cfg.split_seed}）",
+              flush=True)
+        # 逐条核对训练与留出没有交集。断言而不是注释：这个 bug 不会报错，
+        # 只会让"泛化误差"悄悄变成拟合误差，然后一路写进 README。
+        for dtr, dva in zip(subsets, val_subsets):
+            overlap = set(dtr.episode_lengths) & set(dva.episode_lengths)
+            assert not overlap, f"{dtr.task} 训练/留出集重叠：{sorted(overlap)[:5]}"
+        # shuffle 而不是顺序读：多任务的 val 是三个数据集拼起来的，顺序读会让
+        # 前 n 个 batch 全部落在第一个任务里，val loss 只反映那一个任务。
+        # 生成器每次 val 前重新播种，所以取到的始终是同一批样本。
+        val_gen = torch.Generator()
+        val_loader = DataLoader(
+            val_dataset, batch_size=cfg.batch_size, shuffle=True, generator=val_gen,
+            num_workers=min(2, cfg.num_workers), collate_fn=collate, drop_last=True,
+            persistent_workers=False, pin_memory=True,
+        )
+
     # ---- 模型 ----
     act_dim, proprio_dim = subsets[0].act_dim, subsets[0].proprio_dim
     for d in subsets[1:]:
@@ -134,6 +214,15 @@ def main(cfg: DictConfig) -> None:
     # 少了优化器动量，续跑等于把 AdamW 重新预热一遍，loss 会有个可见的台阶。
     start_step = 0
     last_path = out_dir / "last.pt"
+    # 上一次是发散退出的，就不要从 last.pt 续跑 —— 那份权重已经坏了，
+    # 续上去只会接着发散，而且看起来像"又白跑了一轮"。清掉标记从头开始。
+    diverged_mark = out_dir / "DIVERGED.txt"
+    if diverged_mark.exists() and cfg.get("resume", True):
+        print(f"\n上一轮在此目录发散过（见 {diverged_mark.name}），本次从第 0 步重新开始。",
+              flush=True)
+        diverged_mark.unlink()
+        if last_path.exists():
+            last_path.rename(out_dir / "last_diverged.pt")
     if cfg.get("resume", True) and last_path.exists():
         blob = torch.load(last_path, map_location=cfg.device, weights_only=False)
         load_trainable_state_dict(policy, blob["model"])
@@ -170,6 +259,11 @@ def main(cfg: DictConfig) -> None:
     policy.train()
     step, t0, running = start_step, time.perf_counter(), []
     steps_done_this_run = 0
+    # 发散看门狗。2026-09-12 有一轮 FM 在第 35400 步开始渐进失稳：梯度范数从 3.75
+    # 一路爬到 1.1e6，验证 loss 从 0.158 涨到 0.713，而训练照常跑完 60000 步、
+    # 照常存了 checkpoint、照常被评测（三个任务 3%/超时），白花了一小时。
+    # 症状在验证 loss 上早就看得见，只是没有人看。
+    best_val, bad_val_checks = float("inf"), 0
     while step < cfg.steps:
         for batch in loader:
             if step >= cfg.steps:
@@ -201,6 +295,33 @@ def main(cfg: DictConfig) -> None:
                 if use_wandb:
                     wandb.log({"train/loss": avg, "train/lr": opt.param_groups[0]["lr"],
                                "train/grad_norm": float(gn), "step": step})
+
+            if val_loader is not None and step % cfg.get("val_every", 2500) == 0:
+                vl = val_loss(policy, val_loader, cfg, val_gen,
+                              cfg.get("val_batches", 20))
+                print(f"  [val] step {step:6d}  loss {vl:.4f}", flush=True)
+                if use_wandb:
+                    wandb.log({"val/loss": vl, "step": step})
+
+                # 看门狗：验证 loss 连续两次高出历史最低点一半以上就判为发散。
+                # 用验证 loss 而不是训练 loss，是因为训练 loss 被 batch 噪声盖着，
+                # 涨起来不明显；验证 loss 固定了数据与 RNG，是一条干净的曲线。
+                # 两次而不是一次，是为了不被单次抖动误伤；只在训练过半程之前不生效
+                # （早期 loss 本来就在剧烈下降，best 还没稳定）。
+                ratio = cfg.get("divergence_ratio", 1.5)
+                prev_best = best_val          # 判据用的是**更新前**的最低点
+                bad_val_checks = diverging(vl, best_val, bad_val_checks,
+                                           step, cfg.steps, ratio)
+                best_val = min(best_val, vl)
+                if bad_val_checks >= 2:
+                    msg = (f"发散：验证 loss {vl:.4f} 连续两次高于历史最低 "
+                           f"{prev_best:.4f} 的 {ratio} 倍，在第 {step} 步中止。\n"
+                           f"梯度范数请看上面的 |g| 一列；这一轮的权重不可用。")
+                    print(f"\n{msg}", flush=True)
+                    (out_dir / "DIVERGED.txt").write_text(msg + "\n")
+                    if use_wandb:
+                        wandb.finish(exit_code=2)
+                    raise SystemExit(2)
 
             if step % cfg.get("ckpt_every", 1000) == 0 and step % cfg.eval.every != 0:
                 save_last(step)

@@ -14,9 +14,13 @@
 是有代价的，而这份数据的条件分布是单峰的（见 scripts/conditional_spread.py），
 这个代价换不回任何东西。
 
-注意：本项目训练时没有留出验证集，所有 episode 都进了训练。所以这里报的是
-**训练集上的拟合误差**，不是泛化误差。用于方法之间的比较是成立的
-（两者的数据访问完全相同），但不能当作泛化能力的证据。
+误差在**留出集**上算：这些 episode 没有参与训练，所以报的是泛化误差。
+留出的划分从 checkpoint 的 cfg 里读（val_frac / split_seed），三个方法共用同一个
+split_seed，因此拿到的是逐条相同的留出集。
+
+val_frac=0 训练出来的 checkpoint（2026-09-12 之前的全部结果）没有留出集可用，
+这里会直接报错而不是安静地退回训练集 —— "泛化误差"算在训练过的数据上不会有任何
+异常表现，只会给出一个偏小的数字。要复现旧结果就显式加 --split train。
 
     python scripts/action_accuracy.py --ckpt outputs/fmnocfg_mt_tg60_s42/ckpt_60000.pt \
                                       outputs/bcx_mt_tg60_s42/ckpt_60000.pt
@@ -64,19 +68,31 @@ def main():
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--k", type=int, default=16, help="FM 取均值时用几个样本")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--split", default="val", choices=["val", "train", "all"],
+                    help="在哪个划分上算误差。默认 val（泛化误差）")
     args = ap.parse_args()
 
-    print(f"\n===== 动作复现误差：{args.task}（{args.n_obs} 个观测，训练集）=====")
+    split_label = {"val": "留出集，泛化误差", "train": "训练集，拟合误差",
+                   "all": "全部数据"}[args.split]
+    print(f"\n===== 动作复现误差：{args.task}（{args.n_obs} 个观测，{split_label}）=====")
     print("归一化动作单位，数据的边缘标准差按定义为 1.000\n")
     print(f"  {'方法':<34}{'RMSE 中位数':>14}{'占边缘':>10}{'夹爪中间带':>12}")
 
     for ck in args.ckpt:
         policy, cfg, name = load_policy(ck, use_ema=False, device=args.device)
+        val_frac = float(cfg.get("val_frac", 0.0))
+        assert not (args.split == "val" and val_frac <= 0), (
+            f"{ck} 是 val_frac=0 训练的（全部 episode 都进了训练），没有留出集。\n"
+            f"要么用留出集重训，要么显式 --split train 并把结果标成拟合误差。")
         ds = ManiskillDataset(
             default_h5_path(args.task), task=args.task,
             obs_horizon=cfg["obs_horizon"], act_horizon=cfg["act_horizon"],
             img_size=cfg["img_size"], use_goal=cfg.get("use_goal", False),
-            goal_slot=cfg.get("goal_slot", False), task_goal=cfg.get("task_goal", False))
+            goal_slot=cfg.get("goal_slot", False), task_goal=cfg.get("task_goal", False),
+            val_frac=val_frac, split_seed=int(cfg.get("split_seed", 0)),
+            split=args.split)
+        print(f"  [{name}] {args.split} 划分：{len(ds.episode_lengths)} 条轨迹 / "
+              f"{len(ds):,} 个样本", flush=True)
         rng = np.random.default_rng(0)
         picks = rng.choice(len(ds), size=min(args.n_obs, len(ds)), replace=False)
         steps = cfg["model"].get("n_sample_steps", 1 if name.startswith("bc") else 10)
@@ -97,7 +113,9 @@ def main():
         torch.cuda.empty_cache()
 
     # 真实演示的夹爪中间带比例，作为参照
-    ds0 = ManiskillDataset(default_h5_path(args.task), task=args.task)
+    ds0 = ManiskillDataset(default_h5_path(args.task), task=args.task,
+                           val_frac=float(cfg.get("val_frac", 0.0)),
+                           split_seed=int(cfg.get("split_seed", 0)), split=args.split)
     rng = np.random.default_rng(0)
     gs = np.concatenate([ds0[int(j)]["action"][:, -1].numpy()
                          for j in rng.choice(len(ds0), 2000, replace=False)])
